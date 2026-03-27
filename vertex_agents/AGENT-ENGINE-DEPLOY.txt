@@ -1,0 +1,41 @@
+Vertex AI Agent Engine - two-agent layout (Google ADK)
+======================================================
+
+Project: gls-training-486405
+Region:  us-central1
+Model:   gemini-2.5-flash
+
+Folders (pass these paths to adk deploy agent_engine):
+  vertex_agents/cost_metrics_agent
+  vertex_agents/pa_orchestrator_agent
+
+Deploy order
+------------
+1) Deploy cost_metrics_agent first. Configure DATABASE_URL for on-prem Postgres
+   (tunnel + Secret Manager); do not commit secrets.
+2) In Vertex / Agent Engine console, copy the HTTPS URL of the cost agent's
+   Agent Card JSON (often ends with /.well-known/agent.json).
+3) Set COST_AGENT_A2A_CARD_URL to that URL for the orchestrator and redeploy
+   pa_orchestrator_agent.
+
+Telemetry
+---------
+Use scripts/deploy-agent-engine.ps1 (includes):
+  --trace_to_cloud --otel_to_cloud
+
+PowerShell (from repo root)
+---------------------------
+  .\.venv\Scripts\Activate.ps1
+  .\scripts\deploy-agent-engine.ps1 -Agent cost
+  .\scripts\deploy-agent-engine.ps1 -Agent orchestrator
+
+Phase 3 helper (legacy orchestrator path)
+-----------------------------------------
+If you run the FastAPI orchestrator service (`agents/orchestrator/main.py`),
+you can configure Cloud Scheduler using:
+  .\scripts\setup-proactive-scheduler.ps1
+
+Local stack check
+-----------------
+After running .\scripts\start-all.ps1:
+  .\scripts\check-local-stack.ps1

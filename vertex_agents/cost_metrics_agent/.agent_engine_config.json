@@ -1,0 +1,4 @@
+{
+  "display_name": "Cost metrics (cloud_costs)",
+  "description": "Read-only SQL over cloud_costs via DATABASE_URL (hybrid DB / tunnel)."
+}

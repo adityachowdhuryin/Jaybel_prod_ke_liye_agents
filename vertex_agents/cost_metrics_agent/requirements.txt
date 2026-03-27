@@ -1,0 +1,3 @@
+# Merged at deploy with google-cloud-aiplatform[adk,agent_engines] by the ADK CLI.
+psycopg[binary]>=3.2
+google-cloud-bigquery>=3.0.0

@@ -1,0 +1,5 @@
+{
+  "display_name": "PA orchestrator (A2A to cost)",
+  "description": "Orchestrator that delegates cost questions to deployed specialist.",
+  "service_account": "910005263485-compute@developer.gserviceaccount.com"
+}

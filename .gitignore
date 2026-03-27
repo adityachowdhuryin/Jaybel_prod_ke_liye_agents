@@ -1,0 +1,9 @@
+logs/*.log
+logs/*.err.log
+.venv/
+config/gcp.env
+vertex_agents/**/.env
+
+__pycache__/
+*.py[cod]
+*.pyc
