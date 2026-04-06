@@ -4,6 +4,8 @@ Guarded LLM-generated BigQuery SQL for billing analytics.
 Backends (see BILLING_LLM_PROVIDER):
 - Vertex AI (ADC): needs roles/aiplatform.user (predict on Gemini).
 - Google AI API: set GOOGLE_AI_API_KEY or GEMINI_API_KEY (no Vertex IAM).
+
+SQL is returned as structured JSON (response_schema) — no markdown / fence parsing.
 """
 from __future__ import annotations
 
@@ -12,8 +14,10 @@ import os
 import re
 import warnings
 from datetime import date
+from typing import Any
 
 from google.cloud import bigquery
+from pydantic import BaseModel, ConfigDict, Field
 
 try:
     import vertexai
@@ -34,6 +38,45 @@ except Exception:  # pragma: no cover
 
 MAX_BYTES_DEFAULT = 1_000_000_000
 MAX_RESULT_ROWS = 512
+
+
+class BillingSqlGeneration(BaseModel):
+    """VERTEX / Google AI JSON response; validated after parse (not sent as schema $ref)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sql: str = Field(
+        ...,
+        min_length=1,
+        description="Single BigQuery WITH...SELECT or SELECT; raw SQL only, no markdown.",
+    )
+    rationale: str | None = Field(
+        default=None,
+        max_length=4000,
+        description="Optional short note for logging; omit if unnecessary.",
+    )
+
+
+# Gemini structured-output subset: explicit object + properties (no Pydantic $defs).
+BILLING_SQL_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "sql": {
+            "type": "string",
+            "description": (
+                "One BigQuery statement only: WITH ... SELECT or plain SELECT. "
+                "RAW SQL ONLY — no markdown fences, no prose, no backticks around the statement. "
+                "Must satisfy the date window and table rules from the user prompt."
+            ),
+        },
+        "rationale": {
+            "type": "string",
+            "description": "Optional brief note for operators. Omit if not needed.",
+        },
+    },
+    "required": ["sql"],
+}
+
 
 _FORBIDDEN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|CALL|EXECUTE)\b",
@@ -96,6 +139,9 @@ Hard requirements:
 4. Use explicit DATE('YYYY-MM-DD') literals for those bounds (do not use parameters).
 5. Prefer aggregates; for wide scans add LIMIT {MAX_RESULT_ROWS} or less.
 6. Amounts: SUM(cost); alias totals as total_inr or similar. Mention INR in column names where helpful.
+7. Output: you MUST fill the response JSON fields exactly per the API schema: put the full SQL in the `sql` string only (no markdown, no ``` fences). Optional short `rationale` for operators only.
+
+If the user refers to "the same question as above" or "as before", infer the same analytical intent (e.g. top SKUs, breakdown by region) from the conversation and apply any new filters (project id, dates) they specify.
 
 Window context: {window_note}
 
@@ -104,7 +150,18 @@ User question:
 """
 
 
-def _invoke_vertex(prompt: str) -> str:
+def _parse_billing_sql_json_payload(raw: str) -> BillingSqlGeneration:
+    text = (raw or "").strip()
+    if not text:
+        raise RuntimeError("Model returned empty response.")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Model returned invalid JSON: {e}") from e
+    return BillingSqlGeneration.model_validate(data)
+
+
+def _invoke_vertex(prompt: str) -> BillingSqlGeneration:
     if not _VERTEX_OK:
         raise RuntimeError("google-cloud-aiplatform / vertexai not installed.")
     project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("BQ_BILLING_PROJECT", "")
@@ -118,17 +175,17 @@ def _invoke_vertex(prompt: str) -> str:
         raise RuntimeError("GOOGLE_CLOUD_PROJECT (or BQ_BILLING_PROJECT) must be set for Vertex.")
     vertexai.init(project=project, location=location)
     model = GenerativeModel(model_id)
-    r = model.generate_content(
-        prompt,
-        generation_config=GenerationConfig(temperature=0.1, max_output_tokens=4096),
+    gen_cfg = GenerationConfig(
+        temperature=0.1,
+        max_output_tokens=4096,
+        response_mime_type="application/json",
+        response_schema=BILLING_SQL_RESPONSE_SCHEMA,
     )
-    text = (r.text or "").strip()
-    if not text:
-        raise RuntimeError("Vertex model returned empty text.")
-    return text
+    r = model.generate_content(prompt, generation_config=gen_cfg)
+    return _parse_billing_sql_json_payload(r.text or "")
 
 
-def _invoke_google_ai(prompt: str) -> str:
+def _invoke_google_ai(prompt: str) -> BillingSqlGeneration:
     if not _GENAI_OK:
         raise RuntimeError("google-generativeai is not installed.")
     key = google_ai_api_key()
@@ -137,21 +194,27 @@ def _invoke_google_ai(prompt: str) -> str:
     mid = os.environ.get("BILLING_LLM_GOOGLE_AI_MODEL", "gemini-2.5-flash")
     genai.configure(api_key=key)
     model = genai.GenerativeModel(mid)
-    r = model.generate_content(
-        prompt,
-        generation_config={"temperature": 0.1, "max_output_tokens": 4096},
+    gen_cfg = genai.GenerationConfig(
+        temperature=0.1,
+        max_output_tokens=4096,
+        response_mime_type="application/json",
+        response_schema=BILLING_SQL_RESPONSE_SCHEMA,
     )
+    r = model.generate_content(prompt, generation_config=gen_cfg)
     text = (getattr(r, "text", None) or "").strip()
     if not text and r.candidates:
-        # Some responses only have parts
         parts = r.candidates[0].content.parts
         text = "".join(getattr(p, "text", "") for p in parts).strip()
-    if not text:
-        raise RuntimeError("Google AI model returned empty text.")
-    return text
+    return _parse_billing_sql_json_payload(text)
 
 
-def _generate_raw_llm_text(question: str, table_ref: str, window_start: date, window_end: date, window_note: str) -> str:
+def _generate_billing_sql_generation(
+    question: str,
+    table_ref: str,
+    window_start: date,
+    window_end: date,
+    window_note: str,
+) -> BillingSqlGeneration:
     prompt = _build_sql_prompt(table_ref, window_start, window_end, window_note, question)
     provider = os.environ.get("BILLING_LLM_PROVIDER", "auto").strip().lower()
     key = google_ai_api_key()
@@ -198,6 +261,26 @@ def _first_statement(sql: str) -> str:
     return parts[0].strip()
 
 
+def _normalize_table_reference(sql: str, table_ref: str) -> str:
+    """
+    Gemini may return an unquoted fully-qualified table name; normalize it to a single
+    backticked form so strict policy checks and BigQuery syntax both succeed.
+    """
+    tick = f"`{table_ref}`"
+    if tick in sql:
+        return sql
+    # Accept and normalize explicit component quoting: `p`.`d`.`t` -> `p.d.t`
+    bits = table_ref.split(".")
+    if len(bits) == 3:
+        dotted_tick = f"`{bits[0]}`.`{bits[1]}`.`{bits[2]}`"
+        if dotted_tick in sql:
+            return sql.replace(dotted_tick, tick)
+    # Accept and normalize bare project.dataset.table if exact.
+    if table_ref in sql:
+        return sql.replace(table_ref, tick)
+    return sql
+
+
 def _validate_llm_sql(sql_raw: str, table_ref: str, window_start: date, window_end: date) -> str:
     sql = _first_statement(sql_raw)
     if not sql:
@@ -209,6 +292,7 @@ def _validate_llm_sql(sql_raw: str, table_ref: str, window_start: date, window_e
     probe = _strip_sql_comments(sql)
     if _FORBIDDEN.search(probe):
         raise ValueError("Disallowed SQL keyword detected.")
+    sql = _normalize_table_reference(sql, table_ref)
     tick = f"`{table_ref}`"
     if tick not in sql:
         raise ValueError(f"Query must use the billing table exactly as {tick}.")
@@ -226,16 +310,6 @@ def _validate_llm_sql(sql_raw: str, table_ref: str, window_start: date, window_e
     return sql
 
 
-def _extract_sql_from_model_text(text: str) -> str:
-    m = re.search(r"```(?:sql)?\s*([\s\S]*?)```", text, re.I)
-    if m:
-        return m.group(1).strip()
-    m2 = re.search(r"((?:WITH|SELECT)[\s\S]+)", text, re.I)
-    if m2:
-        return m2.group(1).strip().rstrip("`").strip()
-    return text.strip()
-
-
 def generate_sql(
     question: str,
     table_ref: str,
@@ -248,8 +322,10 @@ def generate_sql(
             "No LLM SQL backend: install google-cloud-aiplatform and/or google-generativeai "
             "and set GOOGLE_AI_API_KEY if not using Vertex."
         )
-    text = _generate_raw_llm_text(question, table_ref, window_start, window_end, window_note)
-    sql = _extract_sql_from_model_text(text)
+    payload = _generate_billing_sql_generation(
+        question, table_ref, window_start, window_end, window_note
+    )
+    sql = payload.sql.replace("\ufeff", "").strip()
     return _validate_llm_sql(sql, table_ref, window_start, window_end)
 
 

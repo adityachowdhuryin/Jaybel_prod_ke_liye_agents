@@ -1,6 +1,6 @@
 """
-Phase 4 — Latency / cost optimization: Haiku intent routing, Sonnet + A2A for metrics,
-and Haiku-based session context compression (Vertex AI Claude).
+Phase 4 — Intent routing (Vertex Claude when enabled), session compression via Vertex Gemini Flash,
+and Sonnet task prep when ENABLE_VERTEX_ROUTING.
 """
 from __future__ import annotations
 
@@ -84,59 +84,108 @@ async def call_claude(
     )
 
 
-async def compress_session_context(session_history: list[dict[str, str]]) -> list[dict[str, str]]:
-    """
-    Middleware: if history is large, summarize older turns with Haiku into one dense block
-    and keep the 3 most recent turns for the orchestrator / classifier.
+@dataclass
+class CompressionResult:
+    """Compressed messages for routing + optional Postgres summary row."""
 
-    Threshold: approximate tokens > CONTEXT_TOKEN_APPROX_LIMIT OR raw char length exceeds that
-    value (string-length proxy per Phase 4 spec).
-    """
-    if not session_history:
-        return []
+    messages: list[dict[str, str]]
+    persist_summary: tuple[str, int] | None  # (summary_text, covers_up_to_message_id)
 
+
+def _gemini_session_summary_configured() -> bool:
+    return bool(
+        (os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT", "")).strip()
+    )
+
+
+def _summarize_older_transcript_gemini_sync(older_blob: str) -> str:
+    import vertexai
+    from vertexai.generative_models import GenerationConfig, GenerativeModel
+
+    project = (
+        os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT", "")
+    ).strip()
+    if not project:
+        raise RuntimeError("GOOGLE_CLOUD_PROJECT (or GCP_PROJECT) required for Gemini summary")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1").strip()
+    model_id = (
+        os.environ.get("SESSION_SUMMARY_VERTEX_MODEL")
+        or os.environ.get("VERTEX_MODEL_ID")
+        or "gemini-2.5-flash"
+    ).strip()
+    vertexai.init(project=project, location=location)
+    model = GenerativeModel(model_id)
+    prompt = (
+        "Summarize the following chat turns into one dense bullet summary for a cost-metrics assistant. "
+        "Preserve facts, numbers, product names, GCP project ids, dates, and cost-related constraints. "
+        "Do not greet; output plain text only.\n\n"
+        f"{older_blob}"
+    )
+    r = model.generate_content(
+        prompt,
+        generation_config=GenerationConfig(temperature=0.2, max_output_tokens=1024),
+    )
+    text = (r.text or "").strip()
+    if not text:
+        raise RuntimeError("Gemini returned empty session summary")
+    return text
+
+
+async def _summarize_older_transcript_gemini(older_blob: str) -> str:
+    return await asyncio.to_thread(_summarize_older_transcript_gemini_sync, older_blob)
+
+
+async def compress_session_context_with_ids(
+    rows: list[tuple[int | None, str, str]],
+) -> CompressionResult:
+    """
+    If history is large, summarize older turns with Vertex Gemini Flash (when ADC/project available),
+    keep the 3 most recent turns. When Gemini succeeds, caller may persist persist_summary to Postgres.
+    Otherwise truncate with no persistence.
+    """
+    if not rows:
+        return CompressionResult([], None)
+
+    session_history = [{"role": r, "content": c} for _, r, c in rows]
     approx_tok = _approx_token_count(session_history)
-    # Token budget: char_length/4 as a cheap token proxy (~16k chars ≈ 4k tokens).
     over = approx_tok > CONTEXT_TOKEN_APPROX_LIMIT
 
-    if not over or len(session_history) <= 3:
-        return list(session_history)
+    if not over or len(rows) <= 3:
+        return CompressionResult(list(session_history), None)
 
-    recent = session_history[-3:]
-    older = session_history[:-3]
+    recent_rows = rows[-3:]
+    older_rows = rows[:-3]
     older_blob = "\n".join(
-        f"{m.get('role', 'user').upper()}: {m.get('content', '')}" for m in older
+        f"{r.upper()}: {c}" for _, r, c in older_rows
     )
-    if not ENABLE_VERTEX_ROUTING:
-        return [
-            {
+    older_ids = [i for i, _, _ in older_rows if i is not None]
+    covers = max(older_ids) if older_ids else None
+    recent_dicts = [{"role": r, "content": c} for _, r, c in recent_rows]
+
+    if _gemini_session_summary_configured():
+        try:
+            summary = await _summarize_older_transcript_gemini(older_blob)
+            compressed_prefix: dict[str, str] = {
                 "role": "user",
-                "content": f"[Truncated prior turns — {len(older)} messages omitted]\n",
-            },
-            *recent,
-        ]
+                "content": f"[COMPRESSED SESSION CONTEXT]\n{summary}",
+            }
+            persist = (summary, covers) if covers is not None else None
+            return CompressionResult([compressed_prefix, *recent_dicts], persist)
+        except Exception as e:
+            logger.warning("Gemini session summary failed; truncating: %s", e)
 
-    system = (
-        "Summarize the following chat turns into one dense bullet summary for an assistant. "
-        "Preserve facts, numbers, product names, and cost-related constraints. "
-        "Do not greet; output plain text only."
-    )
-    try:
-        summary = await call_claude(
-            VERTEX_CLAUDE_HAIKU_MODEL,
-            system,
-            older_blob,
-            max_tokens=800,
-        )
-    except Exception as e:
-        logger.warning("compress_session_context Haiku failed, truncating: %s", e)
-        summary = f"[{len(older)} prior messages omitted due to compression error]"
-
-    compressed_prefix = {
+    truncated_prefix = {
         "role": "user",
-        "content": f"[COMPRESSED SESSION CONTEXT]\n{summary}",
+        "content": f"[Truncated prior turns — {len(older_rows)} messages omitted]\n",
     }
-    return [compressed_prefix, *recent]
+    return CompressionResult([truncated_prefix, *recent_dicts], None)
+
+
+async def compress_session_context(session_history: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Backward-compatible: no message ids → compression without DB summary persistence metadata."""
+    rows = [(None, m.get("role", "user"), m.get("content", "")) for m in session_history]
+    result = await compress_session_context_with_ids(rows)
+    return result.messages
 
 
 IntentLabel = Literal["chitchat", "clear", "metrics", "out_of_scope"]
@@ -216,7 +265,7 @@ _GREETING_LOCAL = re.compile(
 
 def classify_intent_local(
     latest_user_message: str,
-    _orchestrator_context: list[dict[str, str]],
+    orchestrator_context: list[dict[str, str]],
 ) -> IntentResult:
     """
     Rule-based router when ENABLE_VERTEX_ROUTING is off (typical local dev).
@@ -256,6 +305,21 @@ def classify_intent_local(
                 "costs by environment, or spend over a date range."
             ),
         )
+
+    # Elliptical follow-up in an active cost thread (e.g. "And Artifact Registry?").
+    if orchestrator_context and len(text) <= 160:
+        prior = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}"
+            for m in orchestrator_context[:-1]
+        )
+        if prior and (
+            _METRICS_LOCAL.search(prior)
+            or "INR" in prior
+            or "cost" in prior.lower()
+            or "billing" in prior.lower()
+            or "bigquery" in prior.lower()
+        ):
+            return IntentResult(intent="metrics", reply="")
 
     return IntentResult(intent="out_of_scope", reply=DEFAULT_OUT_OF_SCOPE_REPLY)
 
@@ -382,3 +446,26 @@ def parse_sse_bytes_to_text(raw: bytes) -> str:
             if isinstance(p, dict) and p.get("text"):
                 collected.append(str(p["text"]))
     return "".join(collected)
+
+
+def sse_stream_has_error(raw: bytes) -> bool:
+    """True if any SSE data frame is a JSON object with error: true."""
+    buffer = raw.decode("utf-8", errors="replace")
+    while "\n\n" in buffer:
+        raw_event, buffer = buffer.split("\n\n", 1)
+        line = next(
+            (ln for ln in raw_event.split("\n") if ln.startswith("data:")),
+            None,
+        )
+        if not line:
+            continue
+        data = line[5:].strip()
+        if not data:
+            continue
+        try:
+            obj = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("error") is True:
+            return True
+    return False

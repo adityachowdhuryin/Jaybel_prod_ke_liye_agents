@@ -25,7 +25,7 @@ gcloud auth application-default login
 ## Run ingest (PowerShell)
 
 ```powershell
-$env:DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/postgres"
+$env:DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5435/postgres"
 .\scripts\ingest-gcp-billing.ps1 `
   -BqProject gls-training-486405 `
   -BqDataset <BILLING_DATASET> `

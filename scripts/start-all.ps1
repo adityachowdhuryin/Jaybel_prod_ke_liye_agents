@@ -27,7 +27,7 @@ $costDir = Join-Path $RepoRoot "agents\cost_agent"
 $orchDir = Join-Path $RepoRoot "agents\orchestrator"
 $feDir = Join-Path $RepoRoot "frontend"
 
-$env:DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5433/postgres"
+$env:DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5435/postgres"
 
 # BigQuery billing export for cost agent (override via config\gcp.env manually or merge)
 if (-not $env:GOOGLE_CLOUD_PROJECT) { $env:GOOGLE_CLOUD_PROJECT = "gls-training-486405" }

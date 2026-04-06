@@ -107,6 +107,55 @@ def _month_bounds(year: int, month: int) -> tuple[date, date]:
     return date(year, month, 1), date(year, month, last)
 
 
+def _last_user_utterance(message: str) -> str:
+    """
+    Multi-turn payloads prefix history as USER:/ASSISTANT: lines. Parse date/service/project
+    filters from the *latest* USER message only so earlier turns (or assistant text mentioning
+    BigQuery, prior windows, etc.) do not override the current question.
+    """
+    if not re.search(r"(?i)multi-turn conversation", message):
+        return message.strip()
+    parts = re.split(r"(?im)^USER:\s*", message)
+    if len(parts) < 2:
+        return message.strip()
+    last = parts[-1].strip()
+    last = re.split(r"(?im)^ASSISTANT:\s*", last, maxsplit=1)[0].strip()
+    return last if last else message.strip()
+
+
+_BOGUS_BILLING_PROJECT_TOKENS = frozenset(
+    {
+        "over",
+        "the",
+        "last",
+        "next",
+        "same",
+        "each",
+        "all",
+        "any",
+        "some",
+        "few",
+        "per",
+        "this",
+        "that",
+        "your",
+        "our",
+        "my",
+        "for",
+        "with",
+        "from",
+        "into",
+        "onto",
+        "about",
+        "than",
+        "more",
+        "less",
+        "broken",
+        "down",
+    }
+)
+
+
 def _parse_time_period(question: str, q_lower: str, today: date) -> tuple[date | None, date | None, list[str]]:
     """Inclusive date range from natural language; also handles YYYY-MM-DD."""
     notes: list[str] = []
@@ -275,6 +324,16 @@ def _extract_billing_region(question: str) -> str | None:
 
 def _extract_gcp_project_id(question: str) -> str | None:
     """Billing export project.id (e.g. jaybel-dev), not necessarily GCP project number."""
+
+    def ok(slug: str) -> str | None:
+        s = _normalize_project_id_slug(slug)
+        key = s.lower().replace("-", "").replace("_", "")
+        if len(key) < 3:
+            return None
+        if s.lower() in _BOGUS_BILLING_PROJECT_TOKENS:
+            return None
+        return s
+
     ql = question.strip()
     # Hyphenated ids with optional spaces around hyphens: "jaybel- dev project", "gls-training-486405 project"
     m_slug = re.search(
@@ -282,42 +341,50 @@ def _extract_gcp_project_id(question: str) -> str | None:
         ql,
     )
     if m_slug:
-        return _normalize_project_id_slug(m_slug.group(1))
+        return ok(m_slug.group(1))
     # "for jaybel-dev on …" / "cost in gls-training-486405 …" (hyphenated billing project.id)
     m_for = re.search(
         r"(?i)\b(?:for|in)\s+([a-z][a-z0-9]*(?:\s*-\s*[a-z0-9]+)+)\b",
         ql,
     )
     if m_for:
-        return _normalize_project_id_slug(m_for.group(1))
+        return ok(m_for.group(1))
     patterns = (
         r"(?i)in\s+the\s+([a-z][a-z0-9-]{1,62})\s+project\b",
-        r"(?i)\bproject\s+([a-z][a-z0-9-]{1,62})\b",
-        r"(?i)\b([a-z][a-z0-9-]{1,62})\s+project\b",
+        # Require billing-like slug for "project my-slug" (avoid "project over the last…")
+        r"(?i)\bproject\s+([a-z][a-z0-9]*(?:-[a-z0-9-]+)+)\b",
+        r"(?i)\b([a-z][a-z0-9]*(?:-[a-z0-9-]+)+)\s+project\b",
+        # "demo project" / single-token ids (min length avoids matching "GCP project")
+        r"(?i)\b([a-z][a-z0-9-]{3,62})\s+project\b",
     )
     for p in patterns:
         m = re.search(p, ql)
         if m:
-            return _normalize_project_id_slug(m.group(1))
+            hit = ok(m.group(1))
+            if hit:
+                return hit
     return None
 
 
 def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFilters:
-    q = question.strip().lower()
+    q_full = question.strip().lower()
+    parse_src = _last_user_utterance(question)
+    q = parse_src.strip().lower()
     notes: list[str] = []
     env: str | None = None
     svc: str | None = None
     ref = today or date.today()
 
     # "Compare prod vs dev …" must not collapse to prod only (substring "prod" wins before "dev").
-    if _mentions_prod(q) and _mentions_dev(q):
+    # Use full transcript so a follow-up can inherit a prod vs dev comparison from an earlier turn.
+    if _mentions_prod(q_full) and _mentions_dev(q_full):
         env = None
         notes.append("comparing prod and dev (both environments)")
         notes.append("unlabeled projects appear as prod in export")
-    elif _mentions_prod(q):
+    elif _mentions_prod(q_full):
         env = "prod"
         notes.append("filtering environment=prod")
-    elif _mentions_dev(q) and not _dev_mention_is_project_slug(question):
+    elif _mentions_dev(q_full) and not _dev_mention_is_project_slug(question):
         env = "dev"
         notes.append("filtering environment=dev")
 
@@ -330,14 +397,14 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
         svc = svc_match.group(1).lower()
         notes.append(f"filtering service contains '{svc}'")
 
-    ps, pe, pnotes = _parse_time_period(question, q, ref)
+    ps, pe, pnotes = _parse_time_period(parse_src, q, ref)
     notes.extend(pnotes)
 
-    br = _extract_billing_region(question)
+    br = _extract_billing_region(parse_src)
     if br:
         notes.append(f"filtering location.region={br}")
 
-    bproj = _extract_gcp_project_id(question)
+    bproj = _extract_gcp_project_id(parse_src)
     if bproj:
         notes.append(f"filtering project.id={bproj}")
 

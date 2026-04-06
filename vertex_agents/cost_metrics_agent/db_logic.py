@@ -20,7 +20,7 @@ import psycopg
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql://postgres:postgres@127.0.0.1:5433/postgres",
+    "postgresql://postgres:postgres@127.0.0.1:5435/postgres",
 )
 SOURCE_MODE = os.environ.get("COST_DATA_SOURCE", "auto").strip().lower()
 

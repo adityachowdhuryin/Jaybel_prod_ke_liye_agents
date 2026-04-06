@@ -15,10 +15,12 @@ import threading
 import uuid
 from typing import Any, AsyncIterator
 
+import asyncpg
 import vertexai
 import vertexai.agent_engines as agent_engines
 
 from intelligence import sse_pack_a2a
+import session_repository
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +32,6 @@ _ORCHESTRATOR_QUERY_URL = os.environ.get(
 ).strip()
 _PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
 _LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1").strip()
-
-_ae_sessions: dict[str, tuple[str, str]] = {}
-_ae_lock = asyncio.Lock()
-
 
 def _resource_from_query_url(url: str) -> str:
     m = re.search(
@@ -105,31 +103,48 @@ def _extract_text_from_vertex_event(event: dict) -> str:
     return "\n".join(out).strip()
 
 
-async def _ensure_ui_session(client_session_id: str) -> tuple[str, str]:
-    """Map UI session id -> (Agent Engine user_id, engine session id)."""
-    async with _ae_lock:
-        if client_session_id in _ae_sessions:
-            return _ae_sessions[client_session_id]
-
+def _create_vertex_session(client_session_id: str) -> tuple[str, str]:
+    """Sync: create Agent Engine session (runs in thread pool)."""
     resource = resolved_engine_resource()
+    vertexai.init(project=_PROJECT, location=_LOCATION)
+    engine = agent_engines.get(resource)
+    user_id = f"ui-{client_session_id}"
+    sess = engine.create_session(user_id=user_id)
+    sid = sess.get("id") if isinstance(sess, dict) else None
+    if not sid:
+        raise RuntimeError("Agent Engine create_session returned no session id")
+    return user_id, str(sid)
 
-    def _create() -> tuple[str, str]:
-        vertexai.init(project=_PROJECT, location=_LOCATION)
-        engine = agent_engines.get(resource)
-        user_id = f"ui-{client_session_id}"
-        sess = engine.create_session(user_id=user_id)
-        sid = sess.get("id") if isinstance(sess, dict) else None
-        if not sid:
-            raise RuntimeError("Agent Engine create_session returned no session id")
-        return user_id, str(sid)
 
-    user_id, engine_sid = await asyncio.to_thread(_create)
+async def _ensure_ui_session(
+    pool: asyncpg.Pool,
+    tenant_id: str,
+    owner_user_id: str,
+    client_session_id: str,
+) -> tuple[str, str]:
+    """Map canonical UI session UUID -> (Agent Engine user_id, engine session id); persisted in Postgres."""
+    cid = uuid.UUID(client_session_id)
+    async with pool.acquire() as conn:
+        existing = await session_repository.get_agent_engine_binding(
+            conn, cid, tenant_id, owner_user_id
+        )
+    if existing:
+        return existing
 
-    async with _ae_lock:
-        if client_session_id in _ae_sessions:
-            return _ae_sessions[client_session_id]
-        _ae_sessions[client_session_id] = (user_id, engine_sid)
-        return user_id, engine_sid
+    user_id, engine_sid = await asyncio.to_thread(
+        _create_vertex_session, client_session_id
+    )
+
+    async with pool.acquire() as conn:
+        await session_repository.upsert_agent_engine_binding(
+            conn,
+            cid,
+            tenant_id,
+            owner_user_id,
+            user_id,
+            engine_sid,
+        )
+    return user_id, engine_sid
 
 
 async def _iter_stream_query(
@@ -173,12 +188,18 @@ async def _iter_stream_query(
 
 
 async def stream_chat_via_agent_engine(
-    message: str, client_session_id: str
+    message: str,
+    client_session_id: str,
+    pool: asyncpg.Pool,
+    tenant_id: str,
+    owner_user_id: str,
 ) -> AsyncIterator[bytes]:
     """
     Stream one user turn through Vertex Agent Engine; output matches frontend SSE parser.
     """
-    user_id, engine_sid = await _ensure_ui_session(client_session_id)
+    user_id, engine_sid = await _ensure_ui_session(
+        pool, tenant_id, owner_user_id, client_session_id
+    )
     task_id = f"task-{uuid.uuid4().hex[:12]}"
 
     try:

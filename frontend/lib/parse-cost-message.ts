@@ -50,6 +50,20 @@ function deriveColumnOrder(keys: string[]): string[] {
   return [...ordered, ...rest];
 }
 
+/** Merge "Region" vs "region", stray keys, etc., so table columns align. */
+function normalizeRow(record: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(record)) {
+    const kn = k.trim().toLowerCase().replace(/\s+/g, "_");
+    const val = v === null || v === undefined ? "" : String(v).trim();
+    const prev = out[kn];
+    if (prev === undefined || prev === "") {
+      out[kn] = val;
+    }
+  }
+  return out;
+}
+
 /**
  * Find first balanced JSON object or array starting at `[` or `{`, respecting strings.
  */
@@ -144,12 +158,7 @@ export function parseCostAssistantMessage(raw: string): ParsedCostMessage {
       return { kind: "plain", text: raw };
     }
     const rows = value.map((row) =>
-      Object.fromEntries(
-        Object.entries(row as Record<string, unknown>).map(([k, v]) => [
-          k,
-          v === null || v === undefined ? "" : String(v),
-        ])
-      )
+      normalizeRow(row as Record<string, unknown>)
     );
     const allKeys = new Set<string>();
     for (const r of rows) {

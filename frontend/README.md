@@ -47,7 +47,7 @@ From repo root (Windows PowerShell):
 ```
 
 This starts:
-- Postgres on `5433` (host)
+- Postgres on `5435` (host; compose mapping)
 - Cost agent on `8001`
 - Orchestrator on `8000`
 - Frontend on `3000`

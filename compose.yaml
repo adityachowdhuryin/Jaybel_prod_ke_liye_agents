@@ -8,9 +8,9 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
-    # Host 5433 avoids clashing with an existing local Postgres on 5432 (e.g. pg-dev).
+    # Host 5435 avoids clashing with local Postgres on 5432 and common alternate ports (e.g. 5433).
     ports:
-      - "5433:5432"
+      - "5435:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -21,6 +21,8 @@ services:
     volumes:
       - agent_pg_data:/var/lib/postgresql
       - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./database/schema_chat_memory.sql:/docker-entrypoint-initdb.d/02-chat-memory.sql:ro
+      - ./database/schema_chat_memory_migration_002.sql:/docker-entrypoint-initdb.d/03-chat-memory-migration-002.sql:ro
 
   cost-agent:
     build:
@@ -54,6 +56,8 @@ services:
       - "8000:8080"
     environment:
       PORT: "8080"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      ORCHESTRATOR_AUTH_DISABLED: "1"
       COST_AGENT_CARD_URL: http://cost-agent:8080/.well-known/agent.json
       COST_AGENT_TASKS_URL: http://cost-agent:8080/tasks/send
       CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
@@ -80,6 +84,8 @@ services:
       - "3000:3000"
     environment:
       NEXT_PUBLIC_ORCHESTRATOR_URL: http://localhost:8000
+      NEXT_PUBLIC_USE_CHAT_PROXY: "1"
+      ORCHESTRATOR_SERVER_URL: http://orchestrator:8080
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules

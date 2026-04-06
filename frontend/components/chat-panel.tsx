@@ -24,7 +24,42 @@ export type ChatMessage = {
 const ORCHESTRATOR_URL =
   process.env.NEXT_PUBLIC_ORCHESTRATOR_URL ?? "http://localhost:8000";
 
+const USE_CHAT_PROXY =
+  process.env.NEXT_PUBLIC_USE_CHAT_PROXY === "1" ||
+  process.env.NEXT_PUBLIC_USE_CHAT_PROXY === "true";
+
+function chatStreamUrl(): string {
+  if (USE_CHAT_PROXY) {
+    return "/api/chat/stream";
+  }
+  return `${ORCHESTRATOR_URL}/chat/stream`;
+}
+
+/** Same-origin when proxying avoids browser blocks / CORS to :8000. */
+function healthCheckUrl(): string {
+  if (USE_CHAT_PROXY) {
+    return "/api/orchestrator/health";
+  }
+  return `${ORCHESTRATOR_URL}/health`;
+}
+
+const HEALTH_FETCH_MS = 10_000;
+const CHAT_STREAM_MAX_MS = 180_000;
+
 const SESSION_STORAGE_KEY = "pa-orchestrator-session";
+/** Optional JWT for /chat/stream when orchestrator auth is enabled (set after login). */
+const ACCESS_TOKEN_STORAGE_KEY = "pa-orchestrator-access-token";
+
+function orchestratorAuthHeaders(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  try {
+    const t = sessionStorage.getItem(ACCESS_TOKEN_STORAGE_KEY);
+    if (t) return { Authorization: `Bearer ${t}` };
+  } catch {
+    /* ignore */
+  }
+  return {};
+}
 
 /** Speech-to-Text v2 sync Recognize: keep clips under ~1 minute. */
 const MAX_RECORDING_MS = 55_000;
@@ -117,14 +152,19 @@ export function ChatPanel() {
     let cancelled = false;
     const check = async () => {
       setHealth("checking");
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), HEALTH_FETCH_MS);
       try {
-        const r = await fetch(`${ORCHESTRATOR_URL}/health`, {
+        const r = await fetch(healthCheckUrl(), {
           method: "GET",
           cache: "no-store",
+          signal: ac.signal,
         });
         if (!cancelled) setHealth(r.ok ? "ok" : "error");
       } catch {
         if (!cancelled) setHealth("error");
+      } finally {
+        clearTimeout(t);
       }
     };
     void check();
@@ -288,8 +328,9 @@ export function ChatPanel() {
     const text = (override ?? input).trim();
     if (!text || loading) return;
 
+    const clientMessageId = crypto.randomUUID();
     const userMsg: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: clientMessageId,
       role: "user",
       content: text,
     };
@@ -303,17 +344,22 @@ export function ChatPanel() {
     setLoading(true);
     requestAnimationFrame(() => textareaRef.current?.focus());
 
+    const streamAc = new AbortController();
+    const streamLimit = setTimeout(() => streamAc.abort(), CHAT_STREAM_MAX_MS);
     try {
-      const res = await fetch(`${ORCHESTRATOR_URL}/chat/stream`, {
+      const res = await fetch(chatStreamUrl(), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "text/event-stream",
+          ...(USE_CHAT_PROXY ? {} : orchestratorAuthHeaders()),
         },
         body: JSON.stringify({
           message: text,
           ...(sessionId ? { session_id: sessionId } : {}),
+          client_message_id: clientMessageId,
         }),
+        signal: streamAc.signal,
       });
 
       const sid = res.headers.get("X-Session-Id");
@@ -388,17 +434,24 @@ export function ChatPanel() {
         }
       }
     } catch (e) {
+      const detail =
+        e instanceof Error
+          ? e.name === "AbortError"
+            ? "Request timed out or was cancelled. Check orchestrator and cost agent logs."
+            : e.message
+          : String(e);
       setMessages((m) =>
         m.map((msg) =>
           msg.id === assistantId
             ? {
                 ...msg,
-                content: `Network error: ${e instanceof Error ? e.message : String(e)}`,
+                content: `Network error: ${detail}`,
               }
             : msg
         )
       );
     } finally {
+      clearTimeout(streamLimit);
       setLoading(false);
       scrollToBottom();
     }
