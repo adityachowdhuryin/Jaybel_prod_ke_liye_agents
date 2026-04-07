@@ -1,6 +1,5 @@
 """
-Phase 4 — Intent routing (Vertex Claude when enabled), session compression via Vertex Gemini Flash,
-and Sonnet task prep when ENABLE_VERTEX_ROUTING.
+Intent routing + task refinement via Vertex Gemini structured outputs.
 """
 from __future__ import annotations
 
@@ -18,26 +17,17 @@ logger = logging.getLogger(__name__)
 # Approximate token budget: use char length / 4 as a cheap stand-in for tokens.
 CONTEXT_TOKEN_APPROX_LIMIT = int(os.environ.get("SESSION_CONTEXT_TOKEN_APPROX", "4000"))
 
-ENABLE_VERTEX_ROUTING = os.environ.get("ENABLE_VERTEX_ROUTING", "false").lower() in (
+ENABLE_VERTEX_ROUTING = os.environ.get("ENABLE_VERTEX_ROUTING", "true").lower() in (
     "1",
     "true",
     "yes",
 )
 
-VERTEX_REGION = os.environ.get("VERTEX_AI_LOCATION", "us-east5")
+VERTEX_REGION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get(
     "GCP_PROJECT", ""
 )
-
-# Vertex model resource IDs — override to match your region / Model Garden publish names.
-VERTEX_CLAUDE_HAIKU_MODEL = os.environ.get(
-    "VERTEX_CLAUDE_HAIKU_MODEL",
-    "claude-haiku-4-5@20250514",
-)
-VERTEX_CLAUDE_SONNET_MODEL = os.environ.get(
-    "VERTEX_CLAUDE_SONNET_MODEL",
-    "claude-sonnet-4-6@20250514",
-)
+VERTEX_MODEL_ID = (os.environ.get("VERTEX_MODEL_ID") or "gemini-2.5-flash").strip()
 
 
 def _approx_token_count(session_history: list[dict[str, str]]) -> int:
@@ -45,42 +35,45 @@ def _approx_token_count(session_history: list[dict[str, str]]) -> int:
     return max(1, total_chars // 4)
 
 
-def _get_vertex_client():
-    from anthropic import AnthropicVertex
+def _call_gemini_sync(
+    system: str,
+    user_prompt: str,
+    max_tokens: int = 1024,
+    response_schema: dict | None = None,
+    response_mime_type: str | None = None,
+) -> str:
+    import vertexai
+    from vertexai.generative_models import GenerationConfig, GenerativeModel
 
     if not VERTEX_PROJECT:
         raise RuntimeError("GOOGLE_CLOUD_PROJECT or GCP_PROJECT is required for Vertex")
-    return AnthropicVertex(region=VERTEX_REGION, project_id=VERTEX_PROJECT)
-
-
-def _call_claude_sync(
-    model: str,
-    system: str,
-    user_prompt: str,
-    max_tokens: int = 1024,
-) -> str:
-    client = _get_vertex_client()
-    msg = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": user_prompt}],
+    vertexai.init(project=VERTEX_PROJECT, location=VERTEX_REGION)
+    model = GenerativeModel(VERTEX_MODEL_ID)
+    prompt = f"{system}\n\n{user_prompt}".strip()
+    cfg = GenerationConfig(
+        temperature=0.1,
+        max_output_tokens=max_tokens,
+        response_mime_type=response_mime_type,
+        response_schema=response_schema,
     )
-    parts: list[str] = []
-    for block in msg.content:
-        if hasattr(block, "text"):
-            parts.append(block.text)
-    return "".join(parts).strip()
+    r = model.generate_content(prompt, generation_config=cfg)
+    return (r.text or "").strip()
 
 
-async def call_claude(
-    model: str,
+async def call_gemini(
     system: str,
     user_prompt: str,
     max_tokens: int = 1024,
+    response_schema: dict | None = None,
+    response_mime_type: str | None = None,
 ) -> str:
     return await asyncio.to_thread(
-        _call_claude_sync, model, system, user_prompt, max_tokens
+        _call_gemini_sync,
+        system,
+        user_prompt,
+        max_tokens,
+        response_schema,
+        response_mime_type,
     )
 
 
@@ -203,14 +196,9 @@ class IntentResult:
     reply: str
 
 
-_JSON_INTENT = re.compile(r"\{[\s\S]*\}")
-
-
 def _parse_intent_json(text: str) -> IntentResult:
-    m = _JSON_INTENT.search(text)
-    raw = m.group(0) if m else text
     try:
-        data = json.loads(raw)
+        data = json.loads(text)
     except json.JSONDecodeError:
         return IntentResult(intent="metrics", reply="")
     intent = str(data.get("intent", "metrics")).lower()
@@ -329,31 +317,31 @@ async def classify_intent_haiku(
     latest_user_message: str,
 ) -> IntentResult:
     """
-    Lightweight router on claude-haiku (Vertex). Returns intent + optional direct Haiku reply.
+    Gemini JSON router. Returns intent + optional direct reply.
     """
     ctx_lines = "\n".join(
         f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
         for m in orchestrator_context
     )
     system = (
-        "You classify the user's latest message for a cost-metrics assistant. "
-        "Respond with ONLY valid JSON (no markdown): "
-        '{"intent":"chitchat"|"clear"|"metrics"|"out_of_scope","reply":"<short assistant reply; empty string if metrics>"} '
-        "Use intent=chitchat for brief greetings, thanks, or tiny talk that should NOT query cost data. "
-        "Use intent=clear if the user wants to reset or clear the conversation. "
-        "Use intent=out_of_scope for requests unrelated to cloud cost/usage/billing "
-        "(e.g. weather, recipes, politics, sports, general knowledge, coding homework, creative writing). "
-        "Reply for out_of_scope must politely say you only help with cloud cost and usage questions. "
-        "Use intent=metrics for anything needing database cost/usage numbers, trends, spikes, budgets, "
-        "services, environments, GCP/AWS/Azure spend, SKU or line-item questions, queries that name a "
-        "GCP project id (e.g. my-app-prod or org-training-486405), or multi-step reasoning over metrics."
+        "Classify the latest user message for a cloud cost assistant. "
+        "Return JSON with keys intent and reply."
     )
     user_prompt = f"Conversation context:\n{ctx_lines}\n\nLatest user message:\n{latest_user_message}"
-    text = await call_claude(
-        VERTEX_CLAUDE_HAIKU_MODEL,
+    schema = {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string"},
+            "reply": {"type": "string"},
+        },
+        "required": ["intent", "reply"],
+    }
+    text = await call_gemini(
         system,
         user_prompt,
         max_tokens=256,
+        response_schema=schema,
+        response_mime_type="application/json",
     )
     return _parse_intent_json(text)
 
@@ -363,7 +351,7 @@ async def refine_task_sonnet(
     latest_user_message: str,
 ) -> str:
     """
-    claude-sonnet (Vertex) prepares a single natural-language task for the Cost Metrics A2A agent.
+    Gemini prepares a single natural-language task for the Cost Metrics A2A agent.
     """
     ctx_lines = "\n".join(
         f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
@@ -378,12 +366,7 @@ async def refine_task_sonnet(
     user_prompt = (
         f"Context:\n{ctx_lines}\n\nUser request:\n{latest_user_message}\n\nSpecialist task:"
     )
-    task = await call_claude(
-        VERTEX_CLAUDE_SONNET_MODEL,
-        system,
-        user_prompt,
-        max_tokens=512,
-    )
+    task = await call_gemini(system, user_prompt, max_tokens=512)
     return task.strip() or latest_user_message
 
 

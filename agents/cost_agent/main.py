@@ -32,6 +32,7 @@ from billing_llm_sql import (
     run_llm_billing_query,
     vertex_available,
 )
+from billing_context_router import llm_context_router_usable, resolve_cost_context
 
 # Optional: ADK agent shell for future tool wiring (no HTTP coupling)
 try:
@@ -672,6 +673,7 @@ def query_cost_data(question: str) -> tuple[str, str]:
     mode = SOURCE_MODE if SOURCE_MODE in {"auto", "bigquery", "postgres"} else "auto"
     f = parse_cost_query(question)
     hint = f.hint
+    rewritten_question = question
     table_project = BQ_BILLING_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     llm_on = os.environ.get("BILLING_AGENT_LLM_SQL", "1").lower() not in ("0", "false", "no")
     table_ref = (
@@ -691,12 +693,31 @@ def query_cost_data(question: str) -> tuple[str, str]:
                     indent=2,
                 )
                 return err, f"{hint}; source=bigquery; currency=INR"
+            if os.environ.get("BILLING_CONTEXT_ROUTER_ENABLED", "1").lower() not in ("0", "false", "no"):
+                if llm_context_router_usable():
+                    try:
+                        routed = resolve_cost_context(question, today=date.today())
+                        f = CostQueryFilters(
+                            env=routed.env,
+                            svc=routed.service,
+                            billing_project_id=routed.billing_project_id,
+                            billing_region=routed.billing_region,
+                            period_start=routed.window_start,
+                            period_end=routed.window_end,
+                            wants_total=routed.wants_total,
+                            wants_top=routed.wants_top,
+                            hint=routed.hint,
+                        )
+                        rewritten_question = routed.rewritten_question or question
+                        hint = f.hint
+                    except Exception:
+                        pass
             ws, we, wnote = compute_llm_date_window(f, date.today())
             extra = hint if hint and hint != "no explicit filters" else ""
             wnote_full = f"{wnote} Parser hints: {extra}".strip() if extra else wnote
             try:
                 body, sh = run_llm_billing_query(
-                    question,
+                    rewritten_question,
                     table_ref,
                     table_project,
                     ws,
