@@ -438,7 +438,39 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     )
 
 
-def compute_llm_date_window(f: CostQueryFilters, today: date) -> tuple[date, date, str]:
+def _preflight_window_with_dry_run(
+    *,
+    job_project: str,
+    table_ref: str,
+    start: date,
+    end: date,
+) -> tuple[bool, int]:
+    """
+    Cheap preflight for a requested window. Returns (fits_bytes_cap, estimated_bytes).
+    If preflight fails, callers should keep conservative behavior.
+    """
+    max_bytes = int(os.environ.get("BILLING_LLM_MAX_BYTES_BILLED", "1000000000"))
+    sql = (
+        f"SELECT 1 FROM `{table_ref}` "
+        f"WHERE DATE(usage_start_time) BETWEEN DATE('{start.isoformat()}') AND DATE('{end.isoformat()}') "
+        "LIMIT 1"
+    )
+    client = bigquery.Client(project=job_project)
+    job = client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False),
+    )
+    est = int(job.total_bytes_processed or 0)
+    return est <= max_bytes, est
+
+
+def compute_llm_date_window(
+    f: CostQueryFilters,
+    today: date,
+    *,
+    preflight_job_project: str | None = None,
+    preflight_table_ref: str | None = None,
+) -> tuple[date, date, str]:
     """Enforce max lookback for LLM-generated SQL (inclusive start/end)."""
     max_days = int(os.environ.get("BILLING_LLM_MAX_LOOKBACK_DAYS", "30"))
     allow_long = os.environ.get("BILLING_LLM_ALLOW_LONG_RANGE", "").lower() in ("1", "true", "yes")
@@ -454,6 +486,20 @@ def compute_llm_date_window(f: CostQueryFilters, today: date) -> tuple[date, dat
         last = calendar.monthrange(start.year, start.month)[1]
         return start.day == 1 and end.day == last
 
+    if max_days <= 0:
+        if f.has_period and f.period_start is not None and f.period_end is not None:
+            return (
+                f.period_start,
+                f.period_end,
+                "No lookback day cap configured; using your requested window. Dry-run still enforces the byte cap.",
+            )
+        start = date(today.year, today.month, 1)
+        return (
+            start,
+            today,
+            "No explicit period in your question — defaulting to this month (month-to-date).",
+        )
+
     if f.has_period and f.period_start is not None and f.period_end is not None:
         start, end = f.period_start, f.period_end
         span = (end - start).days + 1
@@ -468,6 +514,31 @@ def compute_llm_date_window(f: CostQueryFilters, today: date) -> tuple[date, dat
                     f"Using full calendar-month window {start} through {end} ({span} days); "
                     "dry-run still enforces the byte cap."
                 )
+            elif preflight_job_project and preflight_table_ref:
+                try:
+                    ok, est = _preflight_window_with_dry_run(
+                        job_project=preflight_job_project,
+                        table_ref=preflight_table_ref,
+                        start=start,
+                        end=end,
+                    )
+                    if ok:
+                        notes.append(
+                            f"Using your full requested window ({span} days); preflight estimate {est} bytes is within cap. "
+                            "Dry-run still enforces the byte cap."
+                        )
+                    else:
+                        start = end - timedelta(days=max_days - 1)
+                        notes.append(
+                            f"Requested window exceeded {max_days} days and preflight estimate {est} bytes exceeded cap; "
+                            f"clamped to {start} through {end}. Narrow the range or set BILLING_LLM_MAX_LOOKBACK_DAYS=0."
+                        )
+                except Exception:
+                    start = end - timedelta(days=max_days - 1)
+                    notes.append(
+                        f"Requested window exceeded {max_days} days; preflight unavailable, so clamped to {start} through {end}. "
+                        "Set BILLING_LLM_MAX_LOOKBACK_DAYS=0 to disable day-based clamping."
+                    )
             else:
                 start = end - timedelta(days=max_days - 1)
                 notes.append(
@@ -728,7 +799,12 @@ def query_cost_data(question: str) -> tuple[str, str]:
                         hint = f.hint
                     except Exception:
                         pass
-            ws, we, wnote = compute_llm_date_window(f, date.today())
+            ws, we, wnote = compute_llm_date_window(
+                f,
+                date.today(),
+                preflight_job_project=table_project,
+                preflight_table_ref=table_ref,
+            )
             extra = hint if hint and hint != "no explicit filters" else ""
             wnote_full = f"{wnote} Parser hints: {extra}".strip() if extra else wnote
             try:
