@@ -1,143 +1,150 @@
-﻿
-**System Architecture & Implementation Guide: Enterprise Cost & Usage Metrics A2A System**
+﻿**System Architecture & Implementation Guide: Cost Intelligence A2A Stack (Current)**
 
-**1. Executive Summary** This document outlines the architecture and phased build plan for an enterprise-grade AI Personal Assistant specializing in Cost and Usage Metrics. The system utilizes a "Hybrid Agent Mesh" pattern deployed on GCP Vertex AI. It features a conversational orchestrator that routes user queries to an independent specialist agent via the open A2A Protocol.
+## 1) Executive Summary
 
-**Crucial Architecture Modification:** This implementation uses a **local PostgreSQL database** instead of a managed cloud database, requiring a secure tunnel to connect GCP serverless components to the on-premises database environment.
+This project implements a local-first, production-ready conversational system for cloud cost analytics:
 
-**2. Technology Stack**
+- A **Next.js frontend** for chat, session history, and streaming UI.
+- A **FastAPI Orchestrator** for session memory, intent routing, and specialist dispatch.
+- A **FastAPI Cost Agent** for billing analytics via BigQuery with guarded LLM SQL.
+- **A2A-style SSE contract** between orchestrator and specialist agent.
+- **Vertex Gemini 2.5 Flash** used for routing, context interpretation, summarization, and structured SQL generation.
 
-\
-  **Frontend:** Next.js 14, Tailwind CSS, shadcn/ui (deployed on GCP Cloud Run).
+The system now uses a **clean billing BigQuery view** (`clean_billing_view`) in schema-aware mode to reduce irrelevant fields and improve reliability.
 
-- **Agent Framework:** Google Agent Development Kit (ADK).
+## 2) Current Technology Stack
 
-- **Orchestrator Runtime:** Vertex AI Agent Engine.
+- Frontend: `Next.js` (App Router), `Tailwind`, `shadcn/ui`
+- Backend APIs: `FastAPI` (orchestrator + cost agent)
+- Database (chat memory): `PostgreSQL 18`
+- Cost data source: `BigQuery` billing dataset/view
+- LLMs: `gemini-2.5-flash` on Vertex (with optional Google AI fallback for billing SQL path)
+- Streaming: SSE end-to-end (`/chat/stream` and `/tasks/send`)
 
-- **Specialist Runtime:** Vertex AI Agent Engine (deployed independently).
+## 3) Runtime Topology (Local Dev)
 
-- **Agent Communication:** A2A Protocol (Agent-to-Agent) via Server-Sent Events (SSE).
+- Frontend: `http://127.0.0.1:3000`
+- Orchestrator: `http://127.0.0.1:8000`
+- Cost Agent: `http://127.0.0.1:8001`
+- Postgres (docker): host `127.0.0.1:5435`
 
-- **LLMs:** \* Claude Sonnet 4.6 on Vertex AI (Orchestrator, complex reasoning).
-  - Claude Haiku 4.5 on Vertex AI (Intent classification, routing).
+Startup command:
 
-- **State & Memory:** Vertex AI Agent Engine Sessions (short-term) and Memory Bank (long-term).
-- **Persistent Store:** PostgreSQL 18 (Local/On-Premises deployment) replacing Cloud SQL.
-- **Network Ingress (Local DB):** Secure tunnel (e.g., Ngrok, Cloudflare Tunnel, or Tailscale) exposing local port 5432to GCP.
+- `bash scripts/start-all.sh`
 
-**3. Network & Database Architecture (Hybrid Cloud-to-Local)**
+This script:
 
-Because the persistent store is hosted locally while the compute layer (Agent Engine, Cloud Run) is serverless on GCP, Cursor must implement the following network logic:
+- starts Postgres container and applies schemas/migrations
+- starts cost-agent and orchestrator
+- starts Next.js frontend
+- writes `frontend/.env.development.local`
 
-\
-  **Local Development:** The local ADK runner and Next.js app will connect directly to localhost:5432.
-- **Production Deployment:** GCP services will communicate with the database via a provided secure tunnel URL.
-- **Environment Variable Handling:** Cursor must ensure the DATABASE\_URL environment variable dynamically switches between localhost for dev and the tunnel URL for production.
+## 4) Core Components
 
-**4. Core System Components**
+### A) Orchestrator (Conversational Brain)
 
-**A. PA Orchestrator (Conversational Brain)**
+- Maintains chat sessions/messages in Postgres.
+- Performs intent routing (`metrics`, `chitchat`, `clear`, `out_of_scope`) using Gemini JSON routing when enabled.
+- Compresses long histories via Gemini summary before routing.
+- Dispatches cost requests to specialist `/tasks/send`.
+- Streams back A2A-shaped SSE events to the frontend.
 
-- Built with Google ADK in multi-agent orchestration mode.
+### B) Cost Agent (Billing Specialist)
 
-- **Function:** Manages the ReAct loop, reasons over user intent, decides to answer directly or invoke the Cost Metrics agent, dispatches A2A tasks, and streams SSE chunks back to the client WebSocket.
+- Main path: BigQuery + guarded LLM-generated SQL.
+- Context router (Gemini JSON) extracts:
+  - time window
+  - filters (service/project/region/env)
+  - query intent hints (total/top/list)
+- SQL generation (Gemini JSON) + strict validation:
+  - SELECT-only
+  - required table reference
+  - enforced date window literals
+  - bytes dry-run + max billed cap
 
-- **State:** Relies entirely on Agent Engine for session state; no custom session store is required.
+### C) Frontend
 
-**B. Cost & Usage Metrics Agent (Specialist)**
+- Chat panel with optimistic user + assistant streaming.
+- Desktop sidebar with:
+  - list sessions
+  - new chat
+  - delete chat
+  - pagination
+- Uses Next.js API proxy routes for orchestrator health/chat/session APIs.
 
-- An independent ADK agent running on its own Agent Engine instance.
-- **Function:** Connects to the local PostgreSQL database to query financial/usage logs, summarizes findings, and streams them back to the Orchestrator.
+## 5) Memory & Session Model
 
-**C. The A2A Contract (Discovery & Streaming)**
+- Primary persistent memory is in Orchestrator Postgres tables:
+  - sessions
+  - session messages
+  - summaries
+- Cost agent does not maintain separate long-term memory; it uses routed context + rewritten prompt from orchestrator flow.
 
-Cursor should try to implement the following A2A specifications:
+## 6) A2A Contract (Implemented)
 
-1\. Agent Discovery (/.well-known/agent.json) The Specialist agent must expose this exact structure:
+### Specialist discovery
 
-JSON
+- `GET /.well-known/agent.json`
 
-{
+### Specialist execution (streaming)
 
-`  `"name": "Cost Metrics Agent",
+- `POST /tasks/send`
+- returns SSE chunks with:
+  - working status + partial text
+  - completed status + artifact text
 
-`  `"description": "Enterprise tasks: query infrastructure costs, analyze usage spikes, generate budget reports.",
+This format is consumed by orchestrator/frontend A2A parsing logic.
 
-`  `"url": "https://[COST\_AGENT\_CLOUD\_RUN\_URL]",
+## 7) BigQuery Source & Schema Mode (Current)
 
-`  `"version": "1.0.0",
+The cost agent is now configured to query:
 
-`  `"capabilities": { "streaming": true, "pushNotifications": false },
-
-`  `"skills": [
-
-`    `{ 
-
-`      `"id": "metrics.query\_cost", 
-
-`      `"name": "Cost Query",
-
-`      `"description": "Query costs by service, date, or environment.",
-
-`      `"inputModes": ["text"], 
-
-`      `"outputModes": ["text"] 
-
-`    `}
-
-`  `]
-
-}
-
-2\. A2A Task Streaming (POST /tasks/send) The interaction must handle SSE streams formatted as:
-
-JSON
-
-// Working chunk streamed to Orchestrator
-
-{"id":"task-abc123","status":{"state":"working","message": {"role":"agent","parts":[{"text":"Analyzing cost data for March..."}]}}}
-
-// Completion chunk
-
-{"id":"task-abc123","status":{"state":"completed"}, "artifact":{"parts":[{"text":"Total cost is $1,450. The largest spike was..."}]}}
-
-**5. Phased Implementation Plan**
-
-Instruct Cursor to execute the build in the following sequence:
-
-**Phase 1: Foundation (Local Dev & Basic A2A)**
-
-\
-   **Database Init:** Spin up a local PostgreSQL Docker container (docker run -d --name pg-dev -p 5432:5432 postgres:18). Initialize the schema for enterprise cost logs.
-1. **Specialist Agent (Python/ADK):** Build the Cost Metrics Agent. Implement the database connection and the /.well-known/agent.json endpoint. Expose the /tasks/send endpoint for A2A compliance.
-
-1. **Orchestrator Agent (Python/ADK):** Build the PA Orchestrator in multi-agent mode. Configure it to dynamically read the Specialist's Agent Card on startup.
-
-1. **Frontend (Next.js):** Scaffold the UI with shadcn/ui. Implement a WebSocket/SSE connection to stream responses from the Orchestrator progressively.
-
-1. **Local Testing:** Use the adk run command to spin up both agents locally on different ports (e.g., 8000 and 8001). Ensure ADK's built-in, in-memory session service handles local state.
-
-**Phase 2: Hybrid Cloud Deployment & Observability**
-
-1. **Network Tunneling:** Establish the secure tunnel (Ngrok/Cloudflare) pointing to localhost:5432.
-
-1. **Agent Engine Deployment:** Deploy both the Orchestrator and the Cost Metrics Agent to Vertex AI Agent Engine. Inject the tunnel URL into the Specialist Agent's environment variables.
-
-1. **Frontend Deployment:** Deploy the Next.js app to GCP Cloud Run.
-
-1. **Observability Check:** Verify that Agent Engine Tracing is capturing LLM invocations and A2A network calls in the GCP Console.
-
-**Phase 3: Proactive Workflows**
-
-\
-   **Cloud Scheduler:** Configure GCP Cloud Scheduler to hit the Orchestrator's HTTP endpoint daily at a set time (e.g., 8:00 AM).
-1. **Alerting Logic:** The Orchestrator queries the Cost Agent. If anomalies are found, generate a report.
-1. *Constraint Check:* The local database and tunnel must be active when the cron job fires.
-
-**Phase 4: Advanced Intelligence**
-
-\
-   **Model Routing:** Implement logic in the Orchestrator to use Claude Haiku 4.5 for simple routing and Claude Sonnet 4.6 for deep financial analysis.
-
-1. **Context Compression:** Implement a summarization routine for long conversational threads to manage token context window sizes.
-
+- Project: `gls-training-486405`
+- Dataset: `gcp_billing_data`
+- Table/View: `clean_billing_view`
+
+Schema mode:
+
+- `BILLING_BQ_SCHEMA_MODE=clean_view`
+
+This mode maps filters/prompts to clean columns (e.g. `service_name`, `project_id`, `region`, `project_labels`) instead of raw nested export fields.
+
+## 8) Time Window Policy (Current)
+
+- Day-cap can be disabled with:
+  - `BILLING_LLM_MAX_LOOKBACK_DAYS=0`
+- Byte-cap guardrail still enforced via:
+  - dry-run estimate
+  - `BILLING_LLM_MAX_BYTES_BILLED`
+- Full-month explicit windows are preserved (not truncated).
+- Till-now phrases are normalized (`till now`, `until now`, `till date`, `to date`, `so far`) and policy-driven:
+  - `BILLING_DEFAULT_TILL_NOW_SCOPE=full_history`
+  - `BILLING_FULL_HISTORY_START_DATE=2026-01-01`
+
+## 9) Key Environment Flags
+
+- `ENABLE_VERTEX_ROUTING=1` (orchestrator Gemini routing)
+- `BILLING_AGENT_LLM_SQL=1` (LLM SQL path on)
+- `BILLING_CONTEXT_ROUTER_ENABLED=1` (cost context router on)
+- `BILLING_BQ_SCHEMA_MODE=clean_view`
+- `BQ_BILLING_TABLE=clean_billing_view`
+- `BILLING_LLM_MAX_BYTES_BILLED=...`
+- `BILLING_LLM_MAX_LOOKBACK_DAYS=0` (current local policy)
+- `BILLING_DEFAULT_TILL_NOW_SCOPE=full_history`
+- `BILLING_FULL_HISTORY_START_DATE=2026-01-01`
+
+## 10) Operational Notes
+
+- Health endpoints:
+  - orchestrator: `/health`
+  - cost agent: `/health`
+- Frontend proxy mode is enabled to avoid browser CORS/auth issues.
+- For cloud/hybrid deployment, DB tunnel/secret strategy remains supported by environment configuration.
+
+## 11) Current Implementation Status (High-level)
+
+- Chat persistence and summaries: implemented
+- Sidebar session history/new/delete/pagination: implemented
+- Structured JSON routing + structured JSON SQL generation: implemented
+- Clean billing view mode + column mapping: implemented
+- Guardrails (SELECT-only, table/date checks, bytes cap): implemented

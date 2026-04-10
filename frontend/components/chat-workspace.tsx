@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChatPanel, type ChatMessage } from "@/components/chat-panel";
 import { ChatSidebar } from "@/components/chat-sidebar";
 import { SESSION_STORAGE_KEY } from "@/lib/chat-session-key";
@@ -40,11 +40,19 @@ type MessageRow = {
 
 function mapRowsToMessages(rows: MessageRow[]): ChatMessage[] {
   return rows.map((row) => ({
+    // Keep stable ids from DB while preserving optimistic user ids when available.
     id:
-      row.role === "user" && row.client_message_id
+      String(row.role || "")
+        .trim()
+        .toLowerCase() === "user" && row.client_message_id
         ? row.client_message_id
         : `db-${row.id}`,
-    role: row.role === "user" ? "user" : "assistant",
+    role:
+      String(row.role || "")
+        .trim()
+        .toLowerCase() === "user"
+        ? "user"
+        : "assistant",
     content: row.content,
   }));
 }
@@ -54,8 +62,15 @@ export function ChatWorkspace() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [listRefreshKey, setListRefreshKey] = useState(0);
   const [streamBusy, setStreamBusy] = useState(false);
+  const streamBusyRef = useRef(false);
+  const loadTokenRef = useRef(0);
+
+  useEffect(() => {
+    streamBusyRef.current = streamBusy;
+  }, [streamBusy]);
 
   const loadMessagesForSession = useCallback(async (id: string) => {
+    const token = ++loadTokenRef.current;
     try {
       const r = await fetch(messagesUrl(id), {
         method: "GET",
@@ -66,13 +81,18 @@ export function ChatWorkspace() {
         },
       });
       if (!r.ok) {
-        setMessages([]);
+        if (token === loadTokenRef.current && !streamBusyRef.current) {
+          setMessages([]);
+        }
         return;
       }
       const rows = (await r.json()) as MessageRow[];
+      if (token !== loadTokenRef.current || streamBusyRef.current) return;
       setMessages(mapRowsToMessages(rows));
     } catch {
-      setMessages([]);
+      if (token === loadTokenRef.current && !streamBusyRef.current) {
+        setMessages([]);
+      }
     }
   }, []);
 

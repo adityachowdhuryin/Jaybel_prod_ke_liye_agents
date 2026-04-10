@@ -155,8 +155,14 @@ def _looks_discovery_query(text: str) -> bool:
 
 
 def _mentions_till_now(text: str) -> bool:
-    t = text.lower()
-    return any(p in t for p in ("till now", "until now", "to date", "so far"))
+    t = " ".join(text.lower().split())
+    return bool(
+        ("till now" in t)
+        or ("until now" in t)
+        or ("till date" in t)
+        or ("to date" in t)
+        or ("so far" in t)
+    )
 
 
 def _parse_json(raw: str) -> BillingRoutePayload:
@@ -235,9 +241,16 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
     scope = (payload.time_scope or "").strip().lower()
     raw_hint = payload.hint.strip() or "no explicit filters"
     text = payload.rewritten_question or message
+    ws: date | None = None
+    we: date | None = None
     if payload.window_start and payload.window_end:
-        ws = date.fromisoformat(payload.window_start)
-        we = date.fromisoformat(payload.window_end)
+        try:
+            ws = date.fromisoformat(payload.window_start.strip())
+            we = date.fromisoformat(payload.window_end.strip())
+        except ValueError:
+            ws = None
+            we = None
+    if ws is not None and we is not None:
         hint = raw_hint
     elif scope in {"month_to_date", "mtd"} or "this month" in text.lower():
         ws = date(today.year, today.month, 1)

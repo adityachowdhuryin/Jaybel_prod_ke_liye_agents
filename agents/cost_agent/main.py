@@ -33,6 +33,13 @@ from billing_llm_sql import (
     vertex_available,
 )
 from billing_context_router import llm_context_router_usable, resolve_cost_context
+from billing_schema import (
+    is_clean_view_mode,
+    project_id_expr,
+    project_labels_expr,
+    region_expr,
+    service_name_expr,
+)
 
 # Optional: ADK agent shell for future tool wiring (no HTTP coupling)
 try:
@@ -465,8 +472,14 @@ def _preflight_window_with_dry_run(
 
 
 def _mentions_till_now_phrase(text: str) -> bool:
-    t = (text or "").lower()
-    return any(p in t for p in ("till now", "until now", "till date", "to date", "so far"))
+    t = " ".join((text or "").lower().split())
+    return bool(
+        ("till now" in t)
+        or ("until now" in t)
+        or ("till date" in t)
+        or ("to date" in t)
+        or ("so far" in t)
+    )
 
 
 def _default_till_now_scope() -> str:
@@ -509,6 +522,9 @@ def compute_llm_date_window(
         last = calendar.monthrange(start.year, start.month)[1]
         return start.day == 1 and end.day == last
 
+    latest_q = _last_user_utterance(original_question or "")
+    till_now_in_latest = _mentions_till_now_phrase(latest_q)
+
     if max_days <= 0:
         if f.has_period and f.period_start is not None and f.period_end is not None:
             return (
@@ -516,7 +532,7 @@ def compute_llm_date_window(
                 f.period_end,
                 "No lookback day cap configured; using your requested window. Dry-run still enforces the byte cap.",
             )
-        if _mentions_till_now_phrase(original_question) and _default_till_now_scope() == "full_history_to_date":
+        if till_now_in_latest and _default_till_now_scope() == "full_history_to_date":
             start = _full_history_start(today)
             return (
                 start,
@@ -577,7 +593,7 @@ def compute_llm_date_window(
                 )
         return start, end, " ".join(notes) if notes else ""
     end = today
-    if _mentions_till_now_phrase(original_question) and _default_till_now_scope() == "full_history_to_date":
+    if till_now_in_latest and _default_till_now_scope() == "full_history_to_date":
         start = _full_history_start(today)
         return (
             start,
@@ -660,21 +676,22 @@ def _bq_env_sql_fragment(env: str | None) -> str:
     """Filter billing rows by project label environment (resource export schema)."""
     if not env:
         return ""
+    labels_expr = project_labels_expr()
     if env == "prod":
         return """ AND (
           NOT EXISTS (
-            SELECT 1 FROM UNNEST(IFNULL(project.labels, [])) AS l
+            SELECT 1 FROM UNNEST(IFNULL(""" + labels_expr + """, [])) AS l
             WHERE LOWER(l.key) IN ('environment', 'env')
           )
           OR EXISTS (
-            SELECT 1 FROM UNNEST(IFNULL(project.labels, [])) AS l
+            SELECT 1 FROM UNNEST(IFNULL(""" + labels_expr + """, [])) AS l
             WHERE LOWER(l.key) IN ('environment', 'env')
               AND LOWER(l.value) IN ('prod', 'production', 'prd')
           )
         )"""
     if env == "dev":
         return """ AND EXISTS (
-          SELECT 1 FROM UNNEST(IFNULL(project.labels, [])) AS l
+          SELECT 1 FROM UNNEST(IFNULL(""" + labels_expr + """, [])) AS l
           WHERE LOWER(l.key) IN ('environment', 'env')
             AND LOWER(l.value) IN ('dev', 'development')
         )"""
@@ -687,23 +704,26 @@ def query_bigquery(question: str) -> str:
     if not table_project:
         raise RuntimeError("Set BQ_BILLING_PROJECT or GOOGLE_CLOUD_PROJECT for BigQuery queries.")
     table_ref = f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
+    svc_col = service_name_expr()
+    proj_col = project_id_expr()
+    reg_col = region_expr()
 
     filters: list[str] = []
     params: list[bigquery.ScalarQueryParameter] = []
     if f.svc:
         filters.append(
-            "STRPOS(LOWER(IFNULL(service.description, '')), LOWER(@service_needle)) > 0"
+            f"STRPOS(LOWER(IFNULL({svc_col}, '')), LOWER(@service_needle)) > 0"
         )
         params.append(bigquery.ScalarQueryParameter("service_needle", "STRING", f.svc))
     if f.billing_region:
         filters.append(
-            "LOWER(TRIM(COALESCE(location.region, ''))) = LOWER(@billing_region)"
+            f"LOWER(TRIM(COALESCE({reg_col}, ''))) = LOWER(@billing_region)"
         )
         params.append(
             bigquery.ScalarQueryParameter("billing_region", "STRING", f.billing_region)
         )
     if f.billing_project_id:
-        filters.append("project.id = @billing_project_id")
+        filters.append(f"{proj_col} = @billing_project_id")
         params.append(
             bigquery.ScalarQueryParameter("billing_project_id", "STRING", f.billing_project_id)
         )
@@ -719,7 +739,7 @@ def query_bigquery(question: str) -> str:
     label_sql = """COALESCE(
             (
               SELECT ANY_VALUE(l.value)
-              FROM UNNEST(IFNULL(project.labels, [])) AS l
+              FROM UNNEST(IFNULL(""" + project_labels_expr() + """, [])) AS l
               WHERE LOWER(l.key) IN ('environment', 'env')
             ),
             'prod'
@@ -730,7 +750,7 @@ def query_bigquery(question: str) -> str:
     elif f.wants_top:
         sql = f"""
         SELECT
-          service.description AS service_name,
+          {svc_col} AS service_name,
           {label_sql},
           SUM(cost) AS cost_inr
         FROM `{table_ref}`
@@ -743,7 +763,7 @@ def query_bigquery(question: str) -> str:
         sql = f"""
         SELECT
           DATE(usage_start_time) AS usage_date,
-          service.description AS service_name,
+          {svc_col} AS service_name,
           {label_sql},
           SUM(cost) AS cost_inr
         FROM `{table_ref}`
@@ -1052,6 +1072,7 @@ async def health():
         "vertex_generative_available": vertex_available(),
         "google_ai_api_configured": google_ai_configured(),
         "llm_sql_usable": llm_sql_usable(),
+        "billing_schema_mode": "clean_view" if is_clean_view_mode() else "raw_export",
     }
 
 

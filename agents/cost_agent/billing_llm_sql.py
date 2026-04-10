@@ -18,6 +18,7 @@ from typing import Any
 
 from google.cloud import bigquery
 from pydantic import BaseModel, ConfigDict, Field
+from billing_schema import is_clean_view_mode, llm_schema_description
 
 try:
     import vertexai
@@ -114,22 +115,17 @@ def _build_sql_prompt(
     question: str,
 ) -> str:
     ws, we = window_start.isoformat(), window_end.isoformat()
-    schema = f"""
-Allowed table (only source): `{table_ref}`
-
-Standard resource-level export (nested fields):
-- usage_start_time TIMESTAMP — required in WHERE as DATE(usage_start_time) BETWEEN ...
-- cost FLOAT64, currency STRING (this dataset uses **INR**)
-- service.id, service.description
-- sku.id, sku.description
-- project.id, project.name, project.labels (ARRAY)
-- location.region, location.zone, location.country
-- cost_type STRING
-- credits ARRAY<STRUCT<...>> — UNNEST(credits) for credit lines (amount, name, etc.)
-"""
+    schema = llm_schema_description().format(table_ref=table_ref)
+    schema_mode_note = (
+        "You are querying the clean billing view. Use clean columns (e.g. service_name, project_id, region, project_labels) "
+        "and do NOT use nested raw-export fields like service.description or project.id."
+        if is_clean_view_mode()
+        else "You are querying the raw export table with nested fields (e.g. service.description, project.id, location.region)."
+    )
     return f"""You are a BigQuery analyst for GCP billing exports.
 
 {schema}
+{schema_mode_note}
 
 Hard requirements:
 1. A single statement only: WITH ... SELECT ... or plain SELECT. No DDL/DML, no multi-statement.
