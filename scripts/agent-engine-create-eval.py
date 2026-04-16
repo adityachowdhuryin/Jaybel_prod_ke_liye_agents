@@ -19,6 +19,20 @@ import vertexai
 import vertexai.agent_engines as agent_engines
 
 
+def load_cases(cases_path: str | None) -> list[dict]:
+    if not cases_path:
+        return [
+            {"prompt": "List all unique services used till now.", "expected_mode": "answer"},
+            {"prompt": "What are the 3 most expensive services till date?", "expected_mode": "answer"},
+            {"prompt": "What was total spend in march and april combined till now?", "expected_mode": "answer"},
+        ]
+    raw = Path(cases_path).read_text(encoding="utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise SystemExit("--cases must point to a JSON array")
+    return data
+
+
 def extract_text(event: dict) -> str:
     content = event.get("content")
     if not isinstance(content, dict):
@@ -39,22 +53,26 @@ def main() -> None:
     parser.add_argument("--project", default=os.environ.get("GOOGLE_CLOUD_PROJECT", ""))
     parser.add_argument("--location", default=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"))
     parser.add_argument("--out", default="logs/agent-engine-eval-report.json")
+    parser.add_argument(
+        "--cases",
+        default="scripts/evals/hallucination_guardrail_cases.json",
+        help="Path to JSON eval cases",
+    )
     args = parser.parse_args()
 
     if not args.project:
         raise SystemExit("Set --project or GOOGLE_CLOUD_PROJECT.")
 
-    prompts = [
-        "List all unique services used till now.",
-        "What are the 3 most expensive services till date?",
-        "What was total spend in march and april combined till now?",
-    ]
+    cases = load_cases(args.cases)
 
     vertexai.init(project=args.project, location=args.location)
     engine = agent_engines.get(args.resource)
 
     rows: list[dict] = []
-    for prompt in prompts:
+    for case in cases:
+        prompt = str(case.get("prompt") or "").strip()
+        if not prompt:
+            continue
         user_id = f"eval-{uuid.uuid4().hex[:8]}"
         sess = engine.create_session(user_id=user_id)
         session_id = sess.get("id")
@@ -68,6 +86,9 @@ def main() -> None:
         rows.append(
             {
                 "prompt": prompt,
+                "expected_mode": case.get("expected_mode"),
+                "must_contain_any": case.get("must_contain_any", []),
+                "must_not_contain_any": case.get("must_not_contain_any", []),
                 "user_id": user_id,
                 "session_id": session_id,
                 "response": "\n".join(chunks).strip(),

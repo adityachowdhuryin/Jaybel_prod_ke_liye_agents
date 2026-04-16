@@ -586,12 +586,82 @@ def _error_payload(kind: str, detail: str, hint: str | None = None) -> str:
     return json.dumps(payload, indent=2)
 
 
+def _clarification_payload(question: str, options: list[str] | None = None) -> str:
+    payload: dict[str, object] = {
+        "needs_clarification": True,
+        "question": question.strip(),
+    }
+    if options:
+        payload["options"] = [x.strip() for x in options if x and x.strip()]
+    return json.dumps(payload, indent=2)
+
+
+def _extract_top_n(question: str) -> int | None:
+    m = re.search(r"\btop\s+(\d{1,2})\b", question, re.I)
+    if m:
+        try:
+            return max(1, min(50, int(m.group(1))))
+        except ValueError:
+            return None
+    m2 = re.search(r"\b(\d{1,2})\s+most\s+expensive\b", question, re.I)
+    if m2:
+        try:
+            return max(1, min(50, int(m2.group(1))))
+        except ValueError:
+            return None
+    return None
+
+
+def _needs_time_window_clarification(question: str, filters: CostQueryFilters) -> bool:
+    if filters.has_period:
+        return False
+    q = question.lower()
+    if re.search(r"\b(all\s*time|overall\s+to\s+date|full\s+history)\b", q):
+        return False
+    if _mentions_till_now(question):
+        return False
+    if re.search(r"\b(top|highest|largest|biggest|most\s+expensive)\b", q):
+        return True
+    if re.search(r"\b(total|sum|spend|cost)\b", q):
+        return True
+    if re.search(r"\b(list|unique|distinct)\b", q) and re.search(r"\bservice", q):
+        return True
+    return False
+
+
+def _clarification_if_ambiguous(question: str, filters: CostQueryFilters) -> str | None:
+    q = question.lower()
+    if filters.wants_top and _extract_top_n(question) is None:
+        return _clarification_payload(
+            "How many results should I return for 'most expensive'?",
+            ["Top 3", "Top 5", "Top 10"],
+        )
+    if _needs_time_window_clarification(question, filters):
+        return _clarification_payload(
+            "What time window should I use for this cost query?",
+            ["Last 7 days", "This month (month-to-date)", "Full history to date"],
+        )
+    if re.search(r"\bcompare\b", q) and not (
+        re.search(r"\b(prod|production|prd)\b", q) and re.search(r"\b(dev|development)\b", q)
+    ):
+        return _clarification_payload(
+            "What two scopes should I compare?",
+            ["prod vs dev", "project A vs project B", "service A vs service B"],
+        )
+    return None
+
+
 def query_costs(question: str) -> str:
     """Query cloud costs from configured backend.
 
     Returns JSON rows on success, or a JSON object with ``error`` and ``detail``
     when the configured backend is unreachable or misconfigured (never raises).
     """
+    filters = parse_cost_query(question)
+    clarification = _clarification_if_ambiguous(question, filters)
+    if clarification:
+        return clarification
+
     mode = SOURCE_MODE if SOURCE_MODE in {"auto", "bigquery", "postgres"} else "auto"
     if mode in {"auto", "bigquery"} and _bigquery_ready():
         try:

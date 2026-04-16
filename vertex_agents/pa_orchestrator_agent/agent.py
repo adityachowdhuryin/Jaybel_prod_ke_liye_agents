@@ -12,11 +12,15 @@ from google.adk.tools import FunctionTool
 import vertexai
 import vertexai.agent_engines as agent_engines
 
-_ORCHESTRATOR_INSTRUCTION = """You are a platform assistant for GCP operations and cost visibility.
-- When the user asks about cloud spend, costs, services, environments (prod/dev), or usage trends, call the query_cost_specialist tool.
-- For greetings or general platform guidance not requiring live cost data, answer directly.
-- Keep answers concise; when the specialist returns data, synthesize clearly.
-- If the tool returns an error, explain the failure and suggest checking specialist configuration."""
+_ORCHESTRATOR_INSTRUCTION = """You are a routing orchestrator for GCP cost intelligence.
+- For any cost, billing, spend, service-cost, project-cost, region-cost, trend, or usage question: ALWAYS call query_cost_specialist first.
+- Never invent numbers, services, trends, dates, or filters.
+- If user intent is ambiguous (missing time window, scope, grouping, or top-N), ask exactly one concise clarification question instead of guessing.
+- For non-cost greetings or generic platform guidance, answer directly and briefly.
+- If the specialist returns data, summarize faithfully with no extra claims.
+- If the specialist indicates clarification is needed, ask that exact clarification.
+- If the specialist returns an error or insufficient data, state uncertainty clearly and ask one targeted next-step question.
+- Never output internal tool traces or raw debugging events."""
 
 _QUERY_URL = os.environ.get("COST_AGENT_QUERY_ENDPOINT", "").strip()
 _RESOURCE_NAME = os.environ.get("COST_AGENT_ENGINE_RESOURCE", "").strip()
@@ -81,6 +85,26 @@ def _extract_text(event: dict) -> str:
     return "\n".join(out).strip()
 
 
+def _normalize_specialist_output(text: str) -> str:
+    """Convert structured specialist control payloads into plain routing directives."""
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+    try:
+        obj = json.loads(cleaned)
+    except Exception:
+        return cleaned
+    if isinstance(obj, dict) and obj.get("needs_clarification"):
+        q = str(obj.get("question") or "").strip()
+        options = obj.get("options")
+        if isinstance(options, list) and options:
+            opts = "\n".join(f"- {str(x).strip()}" for x in options if str(x).strip())
+            if opts:
+                return f"CLARIFICATION_REQUIRED:\n{q}\nOptions:\n{opts}".strip()
+        return f"CLARIFICATION_REQUIRED:\n{q}".strip()
+    return cleaned
+
+
 def _summarize_events_for_empty_response(events: list) -> str:
     """When no extractable text was found, explain what the stream contained."""
     if not events:
@@ -130,7 +154,7 @@ def query_cost_specialist(question: str) -> str:
                     chunks.append(t)
         joined = "\n".join(chunks).strip()
         if joined:
-            return joined
+            return _normalize_specialist_output(joined)
         return _summarize_events_for_empty_response(events)
     except Exception as e:
         return f"Specialist query failed: {e}"
