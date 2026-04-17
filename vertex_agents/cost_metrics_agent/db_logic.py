@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
+from typing import Any
 
 from google.cloud import bigquery
 import psycopg
@@ -29,6 +30,7 @@ BILLING_BQ_SCHEMA_MODE = os.environ.get("BILLING_BQ_SCHEMA_MODE", "raw_export").
 BQ_BILLING_PROJECT = os.environ.get("BQ_BILLING_PROJECT", "").strip()
 BQ_BILLING_DATASET = os.environ.get("BQ_BILLING_DATASET", "").strip()
 BQ_BILLING_TABLE = os.environ.get("BQ_BILLING_TABLE", "").strip()
+_SCHEMA_VALUE_LIMIT = 100
 
 
 def get_connection():
@@ -579,6 +581,198 @@ def _query_bigquery(question: str) -> str:
     return json.dumps(normalized[:100], indent=2)
 
 
+def _bq_table_ref() -> tuple[str, str]:
+    table_project = BQ_BILLING_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    if not table_project:
+        raise RuntimeError("Set BQ_BILLING_PROJECT or GOOGLE_CLOUD_PROJECT for BigQuery source.")
+    return table_project, f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
+
+
+def _bq_client() -> bigquery.Client:
+    table_project, _ = _bq_table_ref()
+    return bigquery.Client(project=table_project)
+
+
+def _list_schema_fields(fields: list[Any], prefix: str = "") -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for field in fields:
+        name = f"{prefix}{field.name}"
+        rows.append(
+            {
+                "column_name": name,
+                "type": str(field.field_type),
+                "mode": str(field.mode or "NULLABLE"),
+            }
+        )
+        nested = getattr(field, "fields", None) or []
+        if nested:
+            rows.extend(_list_schema_fields(list(nested), prefix=f"{name}."))
+    return rows
+
+
+def _bigquery_schema_rows() -> list[dict[str, str]]:
+    _, table_ref = _bq_table_ref()
+    table = _bq_client().get_table(table_ref)
+    return _list_schema_fields(list(table.schema))
+
+
+def _normalize_column_token(token: str) -> str:
+    return token.strip().strip("`").strip('"').strip("'").strip()
+
+
+def _extract_requested_column_name(question: str, schema_rows: list[dict[str, str]]) -> str | None:
+    patterns = (
+        r"(?i)\bcolumn\s+named\s+[`'\"]?([a-zA-Z_][\w.]*)[`'\"]?",
+        r"(?i)\bcolumn\s+called\s+[`'\"]?([a-zA-Z_][\w.]*)[`'\"]?",
+        r"(?i)\bin\s+the\s+[`'\"]?([a-zA-Z_][\w.]*)[`'\"]?\s+column\b",
+        r"(?i)\bfor\s+[`'\"]?([a-zA-Z_][\w.]*)[`'\"]?\s+column\b",
+        r"(?i)\bdoes\s+[`'\"]?([a-zA-Z_][\w.]*)[`'\"]?\s+exist\b",
+        r"(?i)\bis\s+[`'\"]?([a-zA-Z_][\w.]*)[`'\"]?\s+(?:a\s+)?column\b",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, question)
+        if m:
+            return _normalize_column_token(m.group(1))
+    valid = {row["column_name"].lower(): row["column_name"] for row in schema_rows}
+    q_lower = question.lower()
+    for key, original in sorted(valid.items(), key=lambda item: len(item[0]), reverse=True):
+        if re.search(rf"(?<![\w.]){re.escape(key)}(?![\w.])", q_lower):
+            return original
+    return None
+
+
+def _is_schema_list_query(question: str) -> bool:
+    q = question.lower()
+    return bool(
+        re.search(r"\bwhat\s+are\s+all\s+the\s+column\s+names\b", q)
+        or re.search(r"\blist\s+all\s+(?:the\s+)?column\s+names\b", q)
+        or re.search(r"\bwhat\s+columns\s+(?:exist|are available)\b", q)
+        or re.search(r"\bshow\s+(?:me\s+)?(?:all\s+)?columns\b", q)
+        or re.search(r"\bschema\b", q)
+    )
+
+
+def _is_column_existence_query(question: str) -> bool:
+    q = question.lower()
+    return bool(
+        re.search(r"\bdoes\s+.+\s+exist\b", q)
+        or re.search(r"\bis\s+.+\s+(?:a\s+)?column\b", q)
+        or re.search(r"\bwhich\s+column\b", q)
+    )
+
+
+def _is_distinct_value_query(question: str) -> bool:
+    q = question.lower()
+    return bool(
+        re.search(r"\b(unique|distinct)\s+values?\b", q)
+        or re.search(r"\blist\s+all\s+unique\b", q)
+    )
+
+
+def _schema_field_lookup(schema_rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    return {row["column_name"].lower(): row for row in schema_rows}
+
+
+def _is_supported_distinct_type(field_type: str) -> bool:
+    return field_type.upper() in {
+        "STRING",
+        "INTEGER",
+        "INT64",
+        "FLOAT",
+        "FLOAT64",
+        "NUMERIC",
+        "BIGNUMERIC",
+        "BOOLEAN",
+        "BOOL",
+        "DATE",
+        "TIMESTAMP",
+    }
+
+
+def _query_distinct_column_values(column_name: str, field_type: str) -> str:
+    _, table_ref = _bq_table_ref()
+    sql = f"""
+    SELECT DISTINCT `{column_name}` AS value
+    FROM `{table_ref}`
+    WHERE `{column_name}` IS NOT NULL
+    ORDER BY value
+    LIMIT {_SCHEMA_VALUE_LIMIT}
+    """
+    rows = list(_bq_client().query(sql).result())
+    return json.dumps(
+        [
+            {
+                "column_name": column_name,
+                "type": field_type,
+                "value": str(row["value"]),
+            }
+            for row in rows
+        ],
+        indent=2,
+    )
+
+
+def _query_bigquery_schema(question: str) -> str | None:
+    if not _bigquery_ready():
+        return None
+    q = question.lower()
+    if not (
+        _is_schema_list_query(question)
+        or _is_column_existence_query(question)
+        or _is_distinct_value_query(question)
+    ):
+        return None
+    schema_rows = _bigquery_schema_rows()
+    lookup = _schema_field_lookup(schema_rows)
+
+    if _is_schema_list_query(question) and not _is_distinct_value_query(question):
+        return json.dumps(schema_rows, indent=2)
+
+    column_name = _extract_requested_column_name(question, schema_rows)
+    if not column_name:
+        return _clarification_payload(
+            "Which column name do you want me to inspect?",
+            [row["column_name"] for row in schema_rows[:10]],
+        )
+    field = lookup.get(column_name.lower())
+
+    if _is_column_existence_query(question) and not _is_distinct_value_query(question):
+        if field:
+            return json.dumps(
+                [
+                    {
+                        "column_name": field["column_name"],
+                        "exists": "true",
+                        "type": field["type"],
+                        "mode": field["mode"],
+                    }
+                ],
+                indent=2,
+            )
+        return _error_payload(
+            "unknown_column",
+            f"The column `{column_name}` does not exist in `{BQ_BILLING_TABLE}`.",
+            "Ask for the full column list to inspect the live BigQuery schema.",
+        )
+
+    if _is_distinct_value_query(question):
+        if not field:
+            return _error_payload(
+                "unknown_column",
+                f"The column `{column_name}` does not exist in `{BQ_BILLING_TABLE}`.",
+                "Ask for the full column list to inspect the live BigQuery schema.",
+            )
+        if "." in field["column_name"] or not _is_supported_distinct_type(field["type"]):
+            return _error_payload(
+                "unsupported_schema_query",
+                f"Distinct-value listing is only supported for top-level scalar columns. `{field['column_name']}` is type {field['type']}.",
+                "Try a top-level scalar column such as project_name, project_id, service_name, region, or currency.",
+            )
+        return _query_distinct_column_values(field["column_name"], field["type"])
+
+    return None
+
+
 def _error_payload(kind: str, detail: str, hint: str | None = None) -> str:
     payload: dict[str, str] = {"error": kind, "detail": detail}
     if hint:
@@ -657,6 +851,18 @@ def query_costs(question: str) -> str:
     Returns JSON rows on success, or a JSON object with ``error`` and ``detail``
     when the configured backend is unreachable or misconfigured (never raises).
     """
+    if SOURCE_MODE in {"auto", "bigquery"} and _bigquery_ready():
+        try:
+            schema_result = _query_bigquery_schema(question)
+            if schema_result is not None:
+                return schema_result
+        except Exception as e:
+            return _error_payload(
+                "bigquery_schema_failed",
+                str(e),
+                "Check BQ_BILLING_* and IAM; table/view metadata must be readable.",
+            )
+
     filters = parse_cost_query(question)
     clarification = _clarification_if_ambiguous(question, filters)
     if clarification:
