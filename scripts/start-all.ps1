@@ -1,4 +1,4 @@
-# Start Postgres (Docker) + Cost agent + Orchestrator + Next.js on the host (fast reload).
+# Start Postgres (Docker) + Orchestrator + Next.js on the host (fast reload).
 # From repo root you can instead run: docker compose up --build
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -23,34 +23,22 @@ if ([string]::IsNullOrWhiteSpace($tbl)) {
     Get-Content (Join-Path $RepoRoot "database\schema.sql") -Raw | docker compose exec -T postgres psql -U postgres -d postgres
 }
 
-$costDir = Join-Path $RepoRoot "agents\cost_agent"
 $orchDir = Join-Path $RepoRoot "agents\orchestrator"
 $feDir = Join-Path $RepoRoot "frontend"
 
 $env:DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5435/postgres"
 
-# BigQuery billing export for cost agent (override via config\gcp.env manually or merge)
+# BigQuery billing export defaults (override via config\gcp.env)
 if (-not $env:GOOGLE_CLOUD_PROJECT) { $env:GOOGLE_CLOUD_PROJECT = "gls-training-486405" }
 if (-not $env:BQ_BILLING_PROJECT) { $env:BQ_BILLING_PROJECT = $env:GOOGLE_CLOUD_PROJECT }
 if (-not $env:BQ_BILLING_DATASET) { $env:BQ_BILLING_DATASET = "gcp_billing_data" }
-if (-not $env:BQ_BILLING_TABLE) { $env:BQ_BILLING_TABLE = "gcp_billing_export_resource_v1_01B40E_943432_338729" }
+if (-not $env:BQ_BILLING_TABLE) { $env:BQ_BILLING_TABLE = "clean_billing_view" }
 $saKey = Join-Path $RepoRoot "frontend\.secrets\speech-sa.json"
 if (-not $env:GOOGLE_APPLICATION_CREDENTIALS -and (Test-Path $saKey)) {
     $env:GOOGLE_APPLICATION_CREDENTIALS = $saKey
 }
 
-Write-Host ">>> Starting cost-agent :8001 (logs\cost-agent.log)..."
-Start-Process -FilePath "python" -ArgumentList @(
-    "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8001"
-) -WorkingDirectory $costDir -WindowStyle Hidden `
-    -RedirectStandardOutput (Join-Path $RepoRoot "logs\cost-agent.log") `
-    -RedirectStandardError (Join-Path $RepoRoot "logs\cost-agent.err.log")
-
-Start-Sleep -Seconds 2
-
 Write-Host ">>> Starting orchestrator :8000 (logs\orchestrator.log)..."
-$env:COST_AGENT_CARD_URL = "http://127.0.0.1:8001/.well-known/agent.json"
-$env:COST_AGENT_TASKS_URL = "http://127.0.0.1:8001/tasks/send"
 Start-Process -FilePath "python" -ArgumentList @(
     "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"
 ) -WorkingDirectory $orchDir -WindowStyle Hidden `
@@ -77,7 +65,6 @@ Start-Process -FilePath "cmd.exe" -ArgumentList @(
 
 Write-Host ""
 Write-Host "Done. Open http://127.0.0.1:3000"
-Write-Host "  Cost agent     http://127.0.0.1:8001/health"
 Write-Host "  Orchestrator   http://127.0.0.1:8000/health"
 Write-Host "  Logs: .\logs\"
 Write-Host "Stop host processes: .\scripts\stop-all.ps1"

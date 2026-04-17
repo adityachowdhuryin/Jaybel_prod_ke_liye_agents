@@ -29,6 +29,12 @@ def query_cloud_costs(question: str) -> str:
             if opts:
                 return f"CLARIFICATION_REQUIRED:\n{q}\nOptions:\n{opts}".strip()
         return f"CLARIFICATION_REQUIRED:\n{q}".strip()
+    if isinstance(payload, dict) and payload.get("error"):
+        detail = str(payload.get("detail") or "").strip()
+        hint = str(payload.get("hint") or "").strip()
+        if hint:
+            return f"I cannot verify this from current data. {detail}\nHint: {hint}".strip()
+        return f"I cannot verify this from current data. {detail}".strip()
     return result
 
 

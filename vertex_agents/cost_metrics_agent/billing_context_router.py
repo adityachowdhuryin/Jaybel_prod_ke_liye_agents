@@ -142,7 +142,6 @@ def _full_history_start(today: date) -> date:
             return date.fromisoformat(raw)
         except ValueError:
             pass
-    # Safe default: start of current year (still bounded by dry-run bytes cap).
     return date(today.year, 1, 1)
 
 
@@ -261,7 +260,6 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
         we = today
         hint = raw_hint + f"; defaulted to full history-to-date ({ws} to {we})"
     else:
-        # Ambiguous fallback policy is configurable; default is full-history-to-date.
         if _default_till_now_scope() == "month_to_date":
             ws = date(today.year, today.month, 1)
             we = today

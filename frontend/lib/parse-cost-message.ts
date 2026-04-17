@@ -1,6 +1,6 @@
 /**
  * Parse cost-agent assistant text (Source + Result + JSON) for table rendering.
- * Matches agents/cost_agent/main.py task_stream format.
+ * Matches orchestrator Agent Engine bridge output format.
  */
 
 const RESULT_MARKER = "\n\nResult (amounts in INR ₹ where applicable):\n";

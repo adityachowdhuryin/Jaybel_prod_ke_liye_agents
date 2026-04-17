@@ -18,7 +18,8 @@ from typing import Any
 
 from google.cloud import bigquery
 from pydantic import BaseModel, ConfigDict, Field
-from billing_schema import is_clean_view_mode, llm_schema_description
+
+from .billing_schema import is_clean_view_mode, llm_schema_description
 
 try:
     import vertexai
@@ -42,8 +43,6 @@ MAX_RESULT_ROWS = 512
 
 
 class BillingSqlGeneration(BaseModel):
-    """VERTEX / Google AI JSON response; validated after parse (not sent as schema $ref)."""
-
     model_config = ConfigDict(extra="forbid")
 
     sql: str = Field(
@@ -58,7 +57,6 @@ class BillingSqlGeneration(BaseModel):
     )
 
 
-# Gemini structured-output subset: explicit object + properties (no Pydantic $defs).
 BILLING_SQL_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -98,7 +96,6 @@ def google_ai_configured() -> bool:
 
 
 def llm_sql_usable() -> bool:
-    """Import-level readiness (Vertex SDK and/or API key present). Runtime IAM may still deny Vertex."""
     return _VERTEX_OK or google_ai_configured()
 
 
@@ -220,7 +217,6 @@ def _generate_billing_sql_generation(
     if provider == "vertex":
         return _invoke_vertex(prompt)
 
-    # auto: Vertex first, then Google AI on permission errors
     v_err: BaseException | None = None
     if _VERTEX_OK:
         try:
@@ -233,9 +229,8 @@ def _generate_billing_sql_generation(
         return _invoke_google_ai(prompt)
     if v_err:
         raise RuntimeError(
-            "Vertex AI denied access (aiplatform.endpoints.predict). "
-            "Grant your user roles/aiplatform.user on the project, or set GOOGLE_AI_API_KEY / GEMINI_API_KEY "
-            "for Google AI Studio fallback."
+            "Vertex AI denied access (aiplatform.endpoints.predict). Grant roles/aiplatform.user, "
+            "or set GOOGLE_AI_API_KEY / GEMINI_API_KEY for fallback."
         ) from v_err
     raise RuntimeError(
         "No LLM backend available: install google-cloud-aiplatform for Vertex, "
@@ -258,20 +253,14 @@ def _first_statement(sql: str) -> str:
 
 
 def _normalize_table_reference(sql: str, table_ref: str) -> str:
-    """
-    Gemini may return an unquoted fully-qualified table name; normalize it to a single
-    backticked form so strict policy checks and BigQuery syntax both succeed.
-    """
     tick = f"`{table_ref}`"
     if tick in sql:
         return sql
-    # Accept and normalize explicit component quoting: `p`.`d`.`t` -> `p.d.t`
     bits = table_ref.split(".")
     if len(bits) == 3:
         dotted_tick = f"`{bits[0]}`.`{bits[1]}`.`{bits[2]}`"
         if dotted_tick in sql:
             return sql.replace(dotted_tick, tick)
-    # Accept and normalize bare project.dataset.table if exact.
     if table_ref in sql:
         return sql.replace(table_ref, tick)
     return sql
@@ -280,128 +269,71 @@ def _normalize_table_reference(sql: str, table_ref: str) -> str:
 def _validate_llm_sql(sql_raw: str, table_ref: str, window_start: date, window_end: date) -> str:
     sql = _first_statement(sql_raw)
     if not sql:
-        raise ValueError("Empty SQL after extraction.")
-    lead = sql.lstrip()
-    lu = lead.upper()
-    if not (lu.startswith("SELECT") or lu.startswith("WITH")):
+        raise ValueError("Model returned empty SQL.")
+    if _FORBIDDEN.search(sql):
         raise ValueError("Only SELECT (or WITH ... SELECT) queries are allowed.")
-    probe = _strip_sql_comments(sql)
-    if _FORBIDDEN.search(probe):
-        raise ValueError("Disallowed SQL keyword detected.")
+    cleaned = _strip_sql_comments(sql)
+    if not re.match(r"^\s*(WITH\b[\s\S]*?\bSELECT\b|SELECT\b)", cleaned, re.I):
+        raise ValueError("Only SELECT (or WITH ... SELECT) queries are allowed.")
+
     sql = _normalize_table_reference(sql, table_ref)
-    tick = f"`{table_ref}`"
-    if tick not in sql:
-        raise ValueError(f"Query must use the billing table exactly as {tick}.")
-    pl = probe.lower()
-    if "usage_start_time" not in pl and "_partitiontime" not in pl and "_partition_time" not in pl:
-        raise ValueError("Query must reference usage_start_time (or _PARTITIONTIME) for partitioning.")
-    ws, we = window_start.isoformat(), window_end.isoformat()
-    if ws not in sql or we not in sql:
+    if f"`{table_ref}`" not in sql:
+        raise ValueError(f"Query must use the billing table exactly as `{table_ref}`.")
+
+    ws = window_start.isoformat()
+    we = window_end.isoformat()
+    if f"DATE('{ws}')" not in sql or f"DATE('{we}')" not in sql:
         raise ValueError(
             f"Query must include the enforced window bounds DATE('{ws}') and DATE('{we}') as literals."
         )
-    limits = [int(m.group(1)) for m in re.finditer(r"\bLIMIT\s+(\d+)\b", sql, re.I)]
-    if limits and max(limits) > MAX_RESULT_ROWS:
-        raise ValueError(f"LIMIT must be <= {MAX_RESULT_ROWS}.")
     return sql
 
 
-def generate_sql(
-    question: str,
-    table_ref: str,
-    window_start: date,
-    window_end: date,
-    window_note: str,
-) -> str:
-    if not llm_sql_usable():
-        raise RuntimeError(
-            "No LLM SQL backend: install google-cloud-aiplatform and/or google-generativeai "
-            "and set GOOGLE_AI_API_KEY if not using Vertex."
-        )
-    payload = _generate_billing_sql_generation(
-        question, table_ref, window_start, window_end, window_note
+def _dry_run_bytes(sql: str, project: str) -> int:
+    client = bigquery.Client(project=project)
+    job = client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False),
     )
-    sql = payload.sql.replace("\ufeff", "").strip()
-    return _validate_llm_sql(sql, table_ref, window_start, window_end)
+    return int(job.total_bytes_processed or 0)
+
+
+def _run_query_json(sql: str, project: str, *, max_rows: int = MAX_RESULT_ROWS) -> list[dict[str, str]]:
+    client = bigquery.Client(project=project)
+    rows = list(client.query(sql).result(max_results=max_rows))
+    out: list[dict[str, str]] = []
+    for row in rows:
+        rec: dict[str, str] = {}
+        for key in row.keys():
+            val = row.get(key)
+            rec[str(key)] = "" if val is None else str(val)
+        out.append(rec)
+    return out
 
 
 def run_llm_billing_query(
     question: str,
     table_ref: str,
-    job_project: str,
+    project: str,
     window_start: date,
     window_end: date,
     window_note: str,
 ) -> tuple[str, str]:
-    """Returns (body text for the user, short source hint for logging/UI)."""
-    max_bytes = int(os.environ.get("BILLING_LLM_MAX_BYTES_BILLED", str(MAX_BYTES_DEFAULT)))
-    sql = generate_sql(question, table_ref, window_start, window_end, window_note)
-
-    client = bigquery.Client(project=job_project)
-    dry_cfg = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
-    try:
-        dj = client.query(sql, job_config=dry_cfg)
-        bytes_est = dj.total_bytes_processed or 0
-    except Exception as e:
-        return (
-            json.dumps(
-                {
-                    "error": "dry_run_failed",
-                    "detail": str(e),
-                    "sql_preview": sql[:2000],
-                },
-                indent=2,
-            ),
-            "llm-sql dry-run failed",
-        )
-
-    if bytes_est > max_bytes:
-        msg = (
-            "This query would scan about "
-            f"{bytes_est / 1e9:.2f} GB, which exceeds your maximum of {max_bytes / 1e9:.1f} GB. "
-            "Please narrow the time range (for example a single week), add filters such as project id, "
-            "service, or SKU, or ask for a smaller breakdown."
-        )
-        return (
-            json.dumps(
-                {"error": "bytes_limit", "message": msg, "estimated_bytes": bytes_est},
-                indent=2,
-            ),
-            "llm-sql aborted (dry-run bytes)",
-        )
-
-    exec_cfg = bigquery.QueryJobConfig(
-        maximum_bytes_billed=max_bytes,
-        use_query_cache=False,
+    generated = _generate_billing_sql_generation(
+        question,
+        table_ref,
+        window_start,
+        window_end,
+        window_note,
     )
-    try:
-        rows = list(client.query(sql, job_config=exec_cfg).result())
-    except Exception as e:
-        err_s = str(e)
-        if "bytes billed" in err_s.lower() or "maximum bytes billed" in err_s.lower():
-            return (
-                json.dumps(
-                    {
-                        "error": "execution_bytes_cap",
-                        "message": "The query hit the maximum bytes billed cap. Try a shorter date range or more specific filters.",
-                        "detail": err_s,
-                    },
-                    indent=2,
-                ),
-                "llm-sql execution capped",
-            )
-        return (
-            json.dumps({"error": "execution_failed", "detail": err_s}, indent=2),
-            "llm-sql execution error",
+    sql = _validate_llm_sql(generated.sql, table_ref, window_start, window_end)
+    est = _dry_run_bytes(sql, project)
+    cap = int(os.environ.get("BILLING_LLM_MAX_BYTES_BILLED", str(MAX_BYTES_DEFAULT)))
+    if est > cap:
+        raise RuntimeError(
+            f"Dry-run estimate {est} bytes exceeds cap {cap}. Narrow the date range or filters."
         )
-
-    out: list[dict[str, str]] = []
-    for row in rows:
-        out.append({k: str(v) for k, v in dict(row).items()})
-    body = json.dumps(out[:MAX_RESULT_ROWS], indent=2)
-    note_prefix = f"Note: {window_note}\n\n" if window_note else ""
-    full = note_prefix + "Currency: INR (₹).\n\n" + body
-    return (
-        full,
-        f"llm-sql; window={window_start}..{window_end}; est_bytes={bytes_est}; sql_chars={len(sql)}",
-    )
+    rows = _run_query_json(sql, project)
+    body = json.dumps(rows, ensure_ascii=False, indent=2)
+    short = f"llm-sql; window={window_start}..{window_end}; est_bytes={est}; sql_chars={len(sql)}"
+    return body, short

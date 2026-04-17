@@ -24,31 +24,6 @@ services:
       - ./database/schema_chat_memory.sql:/docker-entrypoint-initdb.d/02-chat-memory.sql:ro
       - ./database/schema_chat_memory_migration_002.sql:/docker-entrypoint-initdb.d/03-chat-memory-migration-002.sql:ro
 
-  cost-agent:
-    build:
-      context: ./agents/cost_agent
-    ports:
-      - "8001:8080"
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
-      PORT: "8080"
-      COST_AGENT_PUBLIC_URL: http://localhost:8001
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)",
-        ]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-
   orchestrator:
     build:
       context: ./agents/orchestrator
@@ -58,11 +33,9 @@ services:
       PORT: "8080"
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
       ORCHESTRATOR_AUTH_DISABLED: "1"
-      COST_AGENT_CARD_URL: http://cost-agent:8080/.well-known/agent.json
-      COST_AGENT_TASKS_URL: http://cost-agent:8080/tasks/send
       CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
     depends_on:
-      cost-agent:
+      postgres:
         condition: service_healthy
     healthcheck:
       test:

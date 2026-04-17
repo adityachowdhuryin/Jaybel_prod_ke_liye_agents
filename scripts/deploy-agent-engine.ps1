@@ -41,7 +41,7 @@ param(
     [string]$BillingDefaultTillNowScope = 'full_history',
     [string]$BillingFullHistoryStartDate = '2026-01-01',
     [string]$AgentEngineId = '',
-    [string]$CostAgentEngineId = '2939267809684750336',
+    [string]$CostAgentEngineId = '5616525846761177088',
     [string]$OrchestratorAgentEngineId = '8296018091465244672',
     [switch]$ForceNewEngine
 )

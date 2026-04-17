@@ -19,6 +19,14 @@ from typing import Any
 from google.cloud import bigquery
 import psycopg
 
+from .billing_context_router import llm_context_router_usable, resolve_cost_context
+from .billing_llm_sql import (
+    google_ai_configured,
+    llm_sql_usable,
+    run_llm_billing_query,
+    vertex_available,
+)
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://postgres:postgres@127.0.0.1:5435/postgres",
@@ -70,6 +78,50 @@ def _month_bounds(year: int, month: int) -> tuple[date, date]:
     return date(year, month, 1), date(year, month, last)
 
 
+def _last_user_utterance(message: str) -> str:
+    if not re.search(r"(?i)multi-turn conversation", message):
+        return message.strip()
+    parts = re.split(r"(?im)^USER:\s*", message)
+    if len(parts) < 2:
+        return message.strip()
+    last = parts[-1].strip()
+    last = re.split(r"(?im)^ASSISTANT:\s*", last, maxsplit=1)[0].strip()
+    return last if last else message.strip()
+
+
+_BOGUS_BILLING_PROJECT_TOKENS = frozenset(
+    {
+        "over",
+        "the",
+        "last",
+        "next",
+        "same",
+        "each",
+        "all",
+        "any",
+        "some",
+        "few",
+        "per",
+        "this",
+        "that",
+        "your",
+        "our",
+        "my",
+        "for",
+        "with",
+        "from",
+        "into",
+        "onto",
+        "about",
+        "than",
+        "more",
+        "less",
+        "broken",
+        "down",
+    }
+)
+
+
 def _mentions_prod(q: str) -> bool:
     return bool(re.search(r"(?<![-])\b(prod|production|prd)\b", q, re.I))
 
@@ -107,28 +159,41 @@ def _project_labels_col() -> str:
 
 
 def _extract_gcp_project_id(question: str) -> str | None:
+    def ok(raw: str | None) -> str | None:
+        if not raw:
+            return None
+        s = _normalize_project_id_slug(raw)
+        if not s:
+            return None
+        if s.lower() in _BOGUS_BILLING_PROJECT_TOKENS:
+            return None
+        return s
+
     ql = question.strip()
     m_slug = re.search(
         r"(?i)\b([a-z][a-z0-9]*(?:\s*-\s*[a-z0-9]+)+)\s+project\b",
         ql,
     )
     if m_slug:
-        return _normalize_project_id_slug(m_slug.group(1))
+        return ok(m_slug.group(1))
     m_for = re.search(
         r"(?i)\b(?:for|in)\s+([a-z][a-z0-9]*(?:\s*-\s*[a-z0-9]+)+)\b",
         ql,
     )
     if m_for:
-        return _normalize_project_id_slug(m_for.group(1))
+        return ok(m_for.group(1))
     patterns = (
         r"(?i)in\s+the\s+([a-z][a-z0-9-]{1,62})\s+project\b",
-        r"(?i)\bproject\s+([a-z][a-z0-9-]{1,62})\b",
-        r"(?i)\b([a-z][a-z0-9-]{1,62})\s+project\b",
+        r"(?i)\bproject\s+([a-z][a-z0-9]*(?:-[a-z0-9-]+)+)\b",
+        r"(?i)\b([a-z][a-z0-9]*(?:-[a-z0-9-]+)+)\s+project\b",
+        r"(?i)\b([a-z][a-z0-9-]{3,62})\s+project\b",
     )
     for p in patterns:
         m = re.search(p, ql)
         if m:
-            return _normalize_project_id_slug(m.group(1))
+            hit = ok(m.group(1))
+            if hit:
+                return hit
     return None
 
 
@@ -297,20 +362,22 @@ class CostQueryFilters:
 
 
 def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFilters:
-    q = question.strip().lower()
+    q_full = question.strip().lower()
+    parse_src = _last_user_utterance(question)
+    q = parse_src.strip().lower()
     notes: list[str] = []
     env: str | None = None
     svc: str | None = None
     ref = today or date.today()
 
-    if _mentions_prod(q) and _mentions_dev(q):
+    if _mentions_prod(q_full) and _mentions_dev(q_full):
         env = None
         notes.append("comparing prod and dev (both environments)")
         notes.append("unlabeled projects appear as prod in export")
-    elif _mentions_prod(q):
+    elif _mentions_prod(q_full):
         env = "prod"
         notes.append("filtering environment=prod")
-    elif _mentions_dev(q) and not _dev_mention_is_project_slug(question):
+    elif _mentions_dev(q_full) and not _dev_mention_is_project_slug(question):
         env = "dev"
         notes.append("filtering environment=dev")
 
@@ -323,7 +390,7 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
         svc = svc_match.group(1).lower()
         notes.append(f"filtering service contains '{svc}'")
 
-    ps, pe, pnotes = _parse_time_period(question, q, ref)
+    ps, pe, pnotes = _parse_time_period(parse_src, q, ref)
     notes.extend(pnotes)
     if ps is None and pe is None and _mentions_till_now(question):
         scope = os.environ.get("BILLING_DEFAULT_TILL_NOW_SCOPE", "full_history").strip().lower()
@@ -336,11 +403,11 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
             pe = ref
             notes.append(f"defaulted to full history-to-date ({ps} to {pe})")
 
-    br = _extract_billing_region(question)
+    br = _extract_billing_region(parse_src)
     if br:
         notes.append(f"filtering location.region={br}")
 
-    bproj = _extract_gcp_project_id(question)
+    bproj = _extract_gcp_project_id(parse_src)
     if bproj:
         notes.append(f"filtering project.id={bproj}")
 
@@ -359,7 +426,7 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
     ) and not breakdown
     wants_top = bool(re.search(r"\b(top|highest|largest|biggest|most\s+expensive)\b", q))
 
-    hint = "; ".join(notes) if notes else "no explicit filters, using full available data"
+    hint = "; ".join(notes) if notes else "no explicit filters"
     return CostQueryFilters(
         env=env,
         svc=svc,
@@ -370,6 +437,148 @@ def parse_cost_query(question: str, *, today: date | None = None) -> CostQueryFi
         wants_total=wants_total,
         wants_top=wants_top,
         hint=hint,
+    )
+
+
+def _preflight_window_with_dry_run(
+    *,
+    job_project: str,
+    table_ref: str,
+    start: date,
+    end: date,
+) -> tuple[bool, int]:
+    max_bytes = int(os.environ.get("BILLING_LLM_MAX_BYTES_BILLED", "1000000000"))
+    sql = (
+        f"SELECT 1 FROM `{table_ref}` "
+        f"WHERE DATE(usage_start_time) BETWEEN DATE('{start.isoformat()}') AND DATE('{end.isoformat()}') "
+        "LIMIT 1"
+    )
+    client = bigquery.Client(project=job_project)
+    job = client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False),
+    )
+    est = int(job.total_bytes_processed or 0)
+    return est <= max_bytes, est
+
+
+def _mentions_till_now_phrase(text: str) -> bool:
+    t = " ".join((text or "").lower().split())
+    return bool(
+        ("till now" in t)
+        or ("until now" in t)
+        or ("till date" in t)
+        or ("to date" in t)
+        or ("so far" in t)
+    )
+
+
+def _default_till_now_scope() -> str:
+    v = os.environ.get("BILLING_DEFAULT_TILL_NOW_SCOPE", "full_history").strip().lower()
+    if v in {"month_to_date", "mtd"}:
+        return "month_to_date"
+    return "full_history_to_date"
+
+
+def compute_llm_date_window(
+    f: CostQueryFilters,
+    today: date,
+    *,
+    preflight_job_project: str | None = None,
+    preflight_table_ref: str | None = None,
+    original_question: str = "",
+) -> tuple[date, date, str]:
+    max_days = int(os.environ.get("BILLING_LLM_MAX_LOOKBACK_DAYS", "30"))
+    allow_long = os.environ.get("BILLING_LLM_ALLOW_LONG_RANGE", "").lower() in ("1", "true", "yes")
+    allow_explicit_calendar = os.environ.get(
+        "BILLING_LLM_ALLOW_EXPLICIT_CALENDAR_WINDOW",
+        "1",
+    ).lower() in ("1", "true", "yes")
+    notes: list[str] = []
+
+    def is_full_calendar_month(start: date, end: date) -> bool:
+        if start.year != end.year or start.month != end.month:
+            return False
+        last = calendar.monthrange(start.year, start.month)[1]
+        return start.day == 1 and end.day == last
+
+    latest_q = _last_user_utterance(original_question or "")
+    till_now_in_latest = _mentions_till_now_phrase(latest_q)
+
+    if max_days <= 0:
+        if f.has_period and f.period_start is not None and f.period_end is not None:
+            return (
+                f.period_start,
+                f.period_end,
+                "No lookback day cap configured; using your requested window. Dry-run still enforces the byte cap.",
+            )
+        if till_now_in_latest and _default_till_now_scope() == "full_history_to_date":
+            start = _full_history_start(today)
+            return (
+                start,
+                today,
+                f"No explicit period in your question — defaulting to full history-to-date ({start} to {today}).",
+            )
+        start = date(today.year, today.month, 1)
+        return (
+            start,
+            today,
+            "No explicit period in your question — defaulting to this month (month-to-date).",
+        )
+
+    if f.has_period and f.period_start is not None and f.period_end is not None:
+        start, end = f.period_start, f.period_end
+        span = (end - start).days + 1
+        if span > max_days:
+            if allow_long:
+                notes.append(
+                    f"Using your full requested window ({span} days) because BILLING_LLM_ALLOW_LONG_RANGE is enabled; dry-run still enforces the byte cap."
+                )
+            elif allow_explicit_calendar and is_full_calendar_month(start, end):
+                notes.append(
+                    f"Using full calendar-month window {start} through {end} ({span} days); dry-run still enforces the byte cap."
+                )
+            elif preflight_job_project and preflight_table_ref:
+                try:
+                    ok, est = _preflight_window_with_dry_run(
+                        job_project=preflight_job_project,
+                        table_ref=preflight_table_ref,
+                        start=start,
+                        end=end,
+                    )
+                    if ok:
+                        notes.append(
+                            f"Using your full requested window ({span} days); preflight estimate {est} bytes is within cap. Dry-run still enforces the byte cap."
+                        )
+                    else:
+                        start = end - timedelta(days=max_days - 1)
+                        notes.append(
+                            f"Requested window exceeded {max_days} days and preflight estimate {est} bytes exceeded cap; clamped to {start} through {end}. Narrow the range or set BILLING_LLM_MAX_LOOKBACK_DAYS=0."
+                        )
+                except Exception:
+                    start = end - timedelta(days=max_days - 1)
+                    notes.append(
+                        f"Requested window exceeded {max_days} days; preflight unavailable, so clamped to {start} through {end}. Set BILLING_LLM_MAX_LOOKBACK_DAYS=0 to disable day-based clamping."
+                    )
+            else:
+                start = end - timedelta(days=max_days - 1)
+                notes.append(
+                    f"Requested window exceeded {max_days} days; clamped to {start} through {end}. Narrow the range or set BILLING_LLM_ALLOW_LONG_RANGE=1."
+                )
+        return start, end, " ".join(notes) if notes else ""
+    end = today
+    if till_now_in_latest and _default_till_now_scope() == "full_history_to_date":
+        start = _full_history_start(today)
+        return (
+            start,
+            end,
+            f"No explicit period in your question — defaulting to full history-to-date ({start} to {end}).",
+        )
+    start = today - timedelta(days=max_days - 1)
+    return (
+        start,
+        end,
+        f"No explicit period in your question — using the last {max_days} days through {end} (cost control).",
     )
 
 
@@ -665,7 +874,7 @@ def _is_distinct_value_query(question: str) -> bool:
     q = question.lower()
     return bool(
         re.search(r"\b(unique|distinct)\s+values?\b", q)
-        or re.search(r"\blist\s+all\s+unique\b", q)
+        and re.search(r"\b(column|columns|field|fields|attribute)\b", q)
     )
 
 
@@ -845,12 +1054,94 @@ def _clarification_if_ambiguous(question: str, filters: CostQueryFilters) -> str
     return None
 
 
-def query_costs(question: str) -> str:
-    """Query cloud costs from configured backend.
+def query_cost_data(question: str) -> tuple[str, str]:
+    mode = SOURCE_MODE if SOURCE_MODE in {"auto", "bigquery", "postgres"} else "auto"
+    f = parse_cost_query(question)
+    hint = f.hint
+    rewritten_question = question
+    router_status = "router_skipped"
+    table_project = BQ_BILLING_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    llm_on = os.environ.get("BILLING_AGENT_LLM_SQL", "1").lower() not in ("0", "false", "no")
+    table_ref = (
+        f"{table_project}.{BQ_BILLING_DATASET}.{BQ_BILLING_TABLE}"
+        if table_project and _bigquery_ready()
+        else ""
+    )
 
-    Returns JSON rows on success, or a JSON object with ``error`` and ``detail``
-    when the configured backend is unreachable or misconfigured (never raises).
-    """
+    if mode in {"auto", "bigquery"} and _bigquery_ready() and table_project:
+        if llm_on:
+            if not llm_sql_usable():
+                err = json.dumps(
+                    {
+                        "error": "llm_sql_unavailable",
+                        "detail": "Install Vertex AI / Google AI dependencies and configure ADC or GOOGLE_AI_API_KEY.",
+                    },
+                    indent=2,
+                )
+                return err, f"{hint}; source=bigquery; currency=INR"
+            if os.environ.get("BILLING_CONTEXT_ROUTER_ENABLED", "1").lower() not in ("0", "false", "no"):
+                if llm_context_router_usable():
+                    try:
+                        routed = resolve_cost_context(question, today=date.today())
+                        f = CostQueryFilters(
+                            env=routed.env,
+                            svc=routed.service,
+                            billing_project_id=routed.billing_project_id,
+                            billing_region=routed.billing_region,
+                            period_start=routed.window_start,
+                            period_end=routed.window_end,
+                            wants_total=routed.wants_total,
+                            wants_top=routed.wants_top,
+                            hint=routed.hint,
+                        )
+                        rewritten_question = routed.rewritten_question or question
+                        hint = f.hint
+                        router_status = "router_ok"
+                    except Exception as e:
+                        router_status = f"router_fallback({type(e).__name__})"
+            ws, we, wnote = compute_llm_date_window(
+                f,
+                date.today(),
+                preflight_job_project=table_project,
+                preflight_table_ref=table_ref,
+                original_question=question,
+            )
+            extra = hint if hint and hint != "no explicit filters" else ""
+            if router_status != "router_ok":
+                extra = f"{extra}; {router_status}".strip("; ").strip()
+            wnote_full = f"{wnote} Parser hints: {extra}".strip() if extra else wnote
+            try:
+                body, sh = run_llm_billing_query(
+                    rewritten_question,
+                    table_ref,
+                    table_project,
+                    ws,
+                    we,
+                    wnote_full,
+                )
+                return body, f"{hint}; {sh}; source=bigquery; currency=INR"
+            except Exception as e:
+                err = json.dumps(
+                    {"error": "llm_sql_failed", "detail": str(e)},
+                    indent=2,
+                )
+                return err, f"{hint}; llm-sql failed; source=bigquery; currency=INR"
+        try:
+            return (
+                _query_bigquery(question),
+                f"{hint}; source=bigquery; BILLING_AGENT_LLM_SQL=0; currency=INR",
+            )
+        except Exception as e:
+            if mode == "bigquery":
+                raise
+            hint = f"{hint}; bigquery unavailable ({e}); fallback=postgres"
+
+    sql, _ = nl_to_sql(question)
+    params = params_for_sql(sql, question)
+    return run_query(sql, params), f"{hint}; source=postgres"
+
+
+def query_costs(question: str) -> str:
     if SOURCE_MODE in {"auto", "bigquery"} and _bigquery_ready():
         try:
             schema_result = _query_bigquery_schema(question)
@@ -868,26 +1159,12 @@ def query_costs(question: str) -> str:
     if clarification:
         return clarification
 
-    mode = SOURCE_MODE if SOURCE_MODE in {"auto", "bigquery", "postgres"} else "auto"
-    if mode in {"auto", "bigquery"} and _bigquery_ready():
-        try:
-            return _query_bigquery(question)
-        except Exception as e:
-            if mode == "bigquery":
-                return _error_payload(
-                    "bigquery_failed",
-                    str(e),
-                    "Check BQ_BILLING_* and IAM; table must exist and be readable.",
-                )
-            # auto: fall through to Postgres
     try:
-        sql, _ = nl_to_sql(question)
-        params = params_for_sql(sql, question)
-        return run_query(sql, params)
+        body, _ = query_cost_data(question)
+        return body
     except Exception as e:
         return _error_payload(
-            "postgres_query_failed",
+            "query_failed",
             str(e),
-            "Set DATABASE_URL to a reachable Postgres instance with cloud_costs. "
-            "127.0.0.1 only works when a DB is bound locally (not in Agent Engine).",
+            "Check BigQuery/Vertex configuration and billing table access.",
         )

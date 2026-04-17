@@ -1,150 +1,129 @@
-﻿**System Architecture & Implementation Guide: Cost Intelligence A2A Stack (Current)**
+﻿**System Architecture & Implementation Guide: Cost Intelligence Stack (Current)**
 
 ## 1) Executive Summary
 
-This project implements a local-first, production-ready conversational system for cloud cost analytics:
+This project now runs in an **Agent Engine-only execution model** for cost intelligence:
 
 - A **Next.js frontend** for chat, session history, and streaming UI.
-- A **FastAPI Orchestrator** for session memory, intent routing, and specialist dispatch.
-- A **FastAPI Cost Agent** for billing analytics via BigQuery with guarded LLM SQL.
-- **A2A-style SSE contract** between orchestrator and specialist agent.
-- **Vertex Gemini 2.5 Flash** used for routing, context interpretation, summarization, and structured SQL generation.
+- A **FastAPI orchestrator bridge** for auth/session persistence and SSE bridging.
+- A deployed **Vertex Agent Engine orchestrator agent**.
+- A deployed **Vertex Agent Engine cost metrics agent**.
+- **Gemini 2.5 Flash** as the primary LLM model family for routing and SQL generation.
 
-The system now uses a **clean billing BigQuery view** (`clean_billing_view`) in schema-aware mode to reduce irrelevant fields and improve reliability.
+The retired local specialist execution path (`agents/cost_agent`) has been removed.
 
 ## 2) Current Technology Stack
 
 - Frontend: `Next.js` (App Router), `Tailwind`, `shadcn/ui`
-- Backend APIs: `FastAPI` (orchestrator + cost agent)
-- Database (chat memory): `PostgreSQL 18`
-- Cost data source: `BigQuery` billing dataset/view
-- LLMs: `gemini-2.5-flash` on Vertex (with optional Google AI fallback for billing SQL path)
-- Streaming: SSE end-to-end (`/chat/stream` and `/tasks/send`)
+- Local backend bridge: `FastAPI` (`agents/orchestrator`)
+- Session store: `PostgreSQL 18`
+- Cloud execution: `Vertex AI Agent Engine` (`pa_orchestrator_agent`, `cost_metrics_agent`)
+- Data source: `BigQuery` view `gls-training-486405.gcp_billing_data.clean_billing_view`
+- Streaming: SSE (`/chat/stream`) from bridge to browser
 
 ## 3) Runtime Topology (Local Dev)
 
 - Frontend: `http://127.0.0.1:3000`
-- Orchestrator: `http://127.0.0.1:8000`
-- Cost Agent: `http://127.0.0.1:8001`
-- Postgres (docker): host `127.0.0.1:5435`
+- Orchestrator bridge: `http://127.0.0.1:8000`
+- Postgres (docker): `127.0.0.1:5435`
 
-Startup command:
+Startup:
 
 - `bash scripts/start-all.sh`
 
-This script:
+What it starts now:
 
-- starts Postgres container and applies schemas/migrations
-- starts cost-agent and orchestrator
-- starts Next.js frontend
-- writes `frontend/.env.development.local`
+- Postgres container + schema setup
+- Orchestrator bridge (Agent Engine-only mode)
+- Next.js frontend
 
-## 4) Core Components
+## 4) Active Execution Path
 
-### A) Orchestrator (Conversational Brain)
+1. UI sends chat to local `/api/chat/stream`.
+2. Next.js route proxies to local orchestrator bridge `/chat/stream`.
+3. Bridge forwards to deployed Vertex Agent Engine orchestrator (`stream_query`).
+4. Orchestrator agent invokes deployed cost agent as needed.
+5. Streamed results are normalized and forwarded back to UI.
 
-- Maintains chat sessions/messages in Postgres.
-- Performs intent routing (`metrics`, `chitchat`, `clear`, `out_of_scope`) using Gemini JSON routing when enabled.
-- Compresses long histories via Gemini summary before routing.
-- Dispatches cost requests to specialist `/tasks/send`.
-- Streams back A2A-shaped SSE events to the frontend.
+There is no local `/tasks/send` specialist path anymore.
 
-### B) Cost Agent (Billing Specialist)
+## 5) Core Components
 
-- Main path: BigQuery + guarded LLM-generated SQL.
-- Context router (Gemini JSON) extracts:
-  - time window
-  - filters (service/project/region/env)
-  - query intent hints (total/top/list)
-- SQL generation (Gemini JSON) + strict validation:
-  - SELECT-only
-  - required table reference
-  - enforced date window literals
-  - bytes dry-run + max billed cap
+### A) Local Orchestrator Bridge (`agents/orchestrator`)
 
-### C) Frontend
+- Persists chat sessions/messages/summaries in Postgres.
+- Maintains idempotency via `client_message_id`.
+- Enforces Agent Engine-only chat path (returns `503` if Agent Engine is unavailable).
+- Provides session APIs:
+  - `/chat/sessions`
+  - `/chat/sessions/{id}/messages`
+  - `/chat/sessions/{id}` (delete)
+  - `/chat/sessions/{id}/export`
 
-- Chat panel with optimistic user + assistant streaming.
-- Desktop sidebar with:
-  - list sessions
-  - new chat
-  - delete chat
-  - pagination
-- Uses Next.js API proxy routes for orchestrator health/chat/session APIs.
+### B) Deployed Orchestrator Agent (`vertex_agents/pa_orchestrator_agent`)
 
-## 5) Memory & Session Model
+- Routes cost and billing/schema questions to cost specialist tool.
+- Avoids speculation; asks clarification when needed.
+- Summarizes specialist output for user-facing responses.
 
-- Primary persistent memory is in Orchestrator Postgres tables:
-  - sessions
-  - session messages
-  - summaries
-- Cost agent does not maintain separate long-term memory; it uses routed context + rewritten prompt from orchestrator flow.
+### C) Deployed Cost Agent (`vertex_agents/cost_metrics_agent`)
 
-## 6) A2A Contract (Implemented)
+- BigQuery-first execution (`COST_DATA_SOURCE=bigquery`).
+- LLM-first cost query pipeline:
+  - context routing (structured JSON)
+  - guarded SQL generation (structured JSON)
+  - strict SQL validation + dry-run bytes guard
+- BigQuery schema introspection path:
+  - list columns
+  - check if column exists
+  - distinct values for supported scalar columns
 
-### Specialist discovery
+## 6) BigQuery Source & Schema Mode
 
-- `GET /.well-known/agent.json`
-
-### Specialist execution (streaming)
-
-- `POST /tasks/send`
-- returns SSE chunks with:
-  - working status + partial text
-  - completed status + artifact text
-
-This format is consumed by orchestrator/frontend A2A parsing logic.
-
-## 7) BigQuery Source & Schema Mode (Current)
-
-The cost agent is now configured to query:
+Configured source:
 
 - Project: `gls-training-486405`
 - Dataset: `gcp_billing_data`
-- Table/View: `clean_billing_view`
+- View: `clean_billing_view`
+- Mode: `BILLING_BQ_SCHEMA_MODE=clean_view`
 
-Schema mode:
+## 7) Guardrails & Clarification Behavior
 
-- `BILLING_BQ_SCHEMA_MODE=clean_view`
-
-This mode maps filters/prompts to clean columns (e.g. `service_name`, `project_id`, `region`, `project_labels`) instead of raw nested export fields.
-
-## 8) Time Window Policy (Current)
-
-- Day-cap can be disabled with:
-  - `BILLING_LLM_MAX_LOOKBACK_DAYS=0`
-- Byte-cap guardrail still enforced via:
-  - dry-run estimate
+- Clarification-first for ambiguous requests (time scope, top-N, compare scope).
+- SQL constraints:
+  - single statement
+  - SELECT/CTE only
+  - enforced table reference
+  - enforced date window literals
+- Cost control:
+  - dry-run estimated bytes
   - `BILLING_LLM_MAX_BYTES_BILLED`
-- Full-month explicit windows are preserved (not truncated).
-- Till-now phrases are normalized (`till now`, `until now`, `till date`, `to date`, `so far`) and policy-driven:
-  - `BILLING_DEFAULT_TILL_NOW_SCOPE=full_history`
-  - `BILLING_FULL_HISTORY_START_DATE=2026-01-01`
+- Schema query safety:
+  - unknown column -> explicit error
+  - unsupported nested distinct queries -> explicit guidance
 
-## 9) Key Environment Flags
+## 8) Key Environment Flags
 
-- `ENABLE_VERTEX_ROUTING=1` (orchestrator Gemini routing)
-- `BILLING_AGENT_LLM_SQL=1` (LLM SQL path on)
-- `BILLING_CONTEXT_ROUTER_ENABLED=1` (cost context router on)
-- `BILLING_BQ_SCHEMA_MODE=clean_view`
+- `ORCHESTRATOR_AGENT_ENGINE_RESOURCE=projects/.../reasoningEngines/...`
+- `ORCHESTRATOR_LOCAL_CHAT=0` (or unset)
+- `BQ_BILLING_PROJECT=gls-training-486405`
+- `BQ_BILLING_DATASET=gcp_billing_data`
 - `BQ_BILLING_TABLE=clean_billing_view`
-- `BILLING_LLM_MAX_BYTES_BILLED=...`
-- `BILLING_LLM_MAX_LOOKBACK_DAYS=0` (current local policy)
+- `BILLING_BQ_SCHEMA_MODE=clean_view`
+- `COST_DATA_SOURCE=bigquery`
+- `BILLING_AGENT_LLM_SQL=1`
+- `BILLING_CONTEXT_ROUTER_ENABLED=1`
+- `BILLING_LLM_PROVIDER=auto`
+- `BILLING_LLM_MAX_BYTES_BILLED=1000000000` (example)
+- `BILLING_LLM_MAX_LOOKBACK_DAYS=0` (recommended in this setup)
 - `BILLING_DEFAULT_TILL_NOW_SCOPE=full_history`
 - `BILLING_FULL_HISTORY_START_DATE=2026-01-01`
 
-## 10) Operational Notes
+## 9) Operational Status
 
-- Health endpoints:
-  - orchestrator: `/health`
-  - cost agent: `/health`
-- Frontend proxy mode is enabled to avoid browser CORS/auth issues.
-- For cloud/hybrid deployment, DB tunnel/secret strategy remains supported by environment configuration.
-
-## 11) Current Implementation Status (High-level)
-
-- Chat persistence and summaries: implemented
+- Agent Engine-only execution: implemented
+- Local specialist execution path: removed
+- Chat persistence + summaries: implemented
 - Sidebar session history/new/delete/pagination: implemented
-- Structured JSON routing + structured JSON SQL generation: implemented
-- Clean billing view mode + column mapping: implemented
-- Guardrails (SELECT-only, table/date checks, bytes cap): implemented
+- Schema introspection against live BigQuery view: implemented
+- Structured routing + structured SQL generation + guardrails: implemented

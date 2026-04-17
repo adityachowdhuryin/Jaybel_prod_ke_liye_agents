@@ -36,12 +36,6 @@ macOS/Linux (from repo root)
   ./scripts/deploy-agent-engine.sh cost --force-new-engine
   ./scripts/deploy-agent-engine.sh orchestrator --force-new-engine --cost-agent-engine-id <NEW_COST_ENGINE_ID>
 
-Phase 3 helper (legacy orchestrator path)
------------------------------------------
-If you run the FastAPI orchestrator service (`agents/orchestrator/main.py`),
-you can configure Cloud Scheduler using:
-  .\scripts\setup-proactive-scheduler.ps1
-
 Local stack check
 -----------------
 After running .\scripts\start-all.ps1:
