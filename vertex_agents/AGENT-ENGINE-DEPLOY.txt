@@ -60,8 +60,31 @@ Agent Engine metrics in the console should increment when you send messages.
 
 Evaluation + Memories tabs
 --------------------------
-- Evaluation runs are created via SDK/notebook (console currently does not create them directly).
-- To populate Memories/Sessions/Traces, run several turns through the deployed orchestrator engine in the same session.
-- Use helper scripts:
-  - scripts/agent-engine-memory-smoke.py
-  - scripts/agent-engine-create-eval.py
+- Memories tab population:
+  - Run multi-turn scenarios against one or more deployed engines:
+    - scripts/agent-engine-memory-smoke.py
+  - Example:
+    - ./.venv/bin/python scripts/agent-engine-memory-smoke.py \
+      --resource projects/.../reasoningEngines/<ORCHESTRATOR_ID> \
+      --resource projects/.../reasoningEngines/<COST_ID> \
+      --scenarios scripts/evals/memory_seed_cases.json \
+      --out logs/agent-engine-memory-seed-report.json
+
+- Evaluation tab population:
+  - Publish real eval runs through Vertex GenAI eval client:
+    - scripts/agent-engine-create-eval.py --publish-to-vertex --gcs-dest gs://<bucket>/<path>
+  - Example:
+    - ./.venv/bin/python scripts/agent-engine-create-eval.py \
+      --resource projects/.../reasoningEngines/<ORCHESTRATOR_ID> \
+      --cases scripts/evals/agent_engine_eval_cases.json \
+      --publish-to-vertex \
+      --gcs-dest gs://<bucket>/agent-engine-evals \
+      --display-name orchestrator-guardrail-eval
+
+- One-command helper for both tabs (memory seeding + two eval runs):
+  - scripts/seed-agent-engine-observability.sh (macOS/Linux)
+  - scripts/seed-agent-engine-observability.ps1 (Windows)
+  - Prereqs:
+    - ORCHESTRATOR_AGENT_ENGINE_RESOURCE
+    - COST_AGENT_ENGINE_RESOURCE
+    - AGENT_ENGINE_EVAL_GCS_DEST

@@ -1,0 +1,18 @@
+[
+  {
+    "name": "cost_preference_memory",
+    "turns": [
+      "Hello, remember I care about spend by project and service.",
+      "What are my top services this month?",
+      "Now focus only on invoice-like cost categories and summarize."
+    ]
+  },
+  {
+    "name": "schema_and_followup_memory",
+    "turns": [
+      "List all columns available in the billing view.",
+      "Now tell me if project_name exists.",
+      "Great. Keep project_name in context for future follow-up questions."
+    ]
+  }
+]

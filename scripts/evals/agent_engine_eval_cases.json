@@ -1,0 +1,47 @@
+[
+  {
+    "prompt": "What are the most expensive services?",
+    "expected_mode": "clarify",
+    "must_contain_any": ["clarification", "time window", "top 3", "top 5", "top 10"]
+  },
+  {
+    "prompt": "What did we spend on Cloud SQL?",
+    "expected_mode": "clarify",
+    "must_contain_any": ["time window", "last 7 days", "this month", "full history"]
+  },
+  {
+    "prompt": "Compare spend.",
+    "expected_mode": "clarify",
+    "must_contain_any": ["compare", "prod vs dev", "project", "service"]
+  },
+  {
+    "prompt": "List the top 3 most expensive services this month.",
+    "expected_mode": "answer",
+    "must_not_contain_any": ["I am not sure", "guess", "probably"]
+  },
+  {
+    "prompt": "List all unique services used till now.",
+    "expected_mode": "answer",
+    "must_not_contain_any": ["I am not sure", "guess", "probably"]
+  },
+  {
+    "prompt": "What are all the column names in the billing view?",
+    "expected_mode": "answer",
+    "must_contain_any": ["column", "project_name", "service_name"]
+  },
+  {
+    "prompt": "Does project_name exist as a column?",
+    "expected_mode": "answer",
+    "must_contain_any": ["project_name", "exists"]
+  },
+  {
+    "prompt": "List all unique values in the project_name column.",
+    "expected_mode": "answer",
+    "must_contain_any": ["project_name"]
+  },
+  {
+    "prompt": "List all unique values in the fake_column_xyz column.",
+    "expected_mode": "answer",
+    "must_contain_any": ["does not exist", "column"]
+  }
+]

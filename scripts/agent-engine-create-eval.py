@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare and run a lightweight Agent Engine evaluation harness.
-
-Note: Vertex console currently indicates evaluation creation is primarily via SDK/Colab.
-This script runs a deterministic prompt suite against an engine and writes a JSON report
-that can be used as a baseline and attached to eval workflows.
-"""
+"""Create Agent Engine eval baselines and optional Vertex evaluation runs."""
 
 from __future__ import annotations
 
@@ -15,8 +10,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pandas as pd
 import vertexai
 import vertexai.agent_engines as agent_engines
+from google.genai import types as genai_types
+from vertexai import Client, types
 
 
 def load_cases(cases_path: str | None) -> list[dict]:
@@ -47,6 +45,50 @@ def extract_text(event: dict) -> str:
     return "\n".join(out).strip()
 
 
+def parse_labels(pairs: list[str]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise SystemExit(f"Invalid --label '{pair}'. Use key=value format.")
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            raise SystemExit(f"Invalid --label '{pair}'. Empty key/value is not allowed.")
+        labels[key] = value
+    return labels
+
+
+def _safe_metric(name: str):
+    metric = getattr(types.RubricMetric, name, None)
+    if metric is None:
+        raise SystemExit(f"SDK missing RubricMetric.{name}; upgrade google-cloud-aiplatform[evaluation].")
+    return metric
+
+
+def default_metrics() -> list:
+    return [
+        _safe_metric("FINAL_RESPONSE_QUALITY"),
+        _safe_metric("TOOL_USE_QUALITY"),
+        _safe_metric("HALLUCINATION"),
+        _safe_metric("SAFETY"),
+    ]
+
+
+def build_eval_dataset(cases: list[dict]) -> pd.DataFrame:
+    prompts: list[str] = []
+    session_inputs: list = []
+    for case in cases:
+        prompt = str(case.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        prompts.append(prompt)
+        session_inputs.append(types.evals.SessionInput(user_id=f"eval-ds-{uuid.uuid4().hex[:8]}", state={}))
+    if not prompts:
+        raise SystemExit("No non-empty prompts found in cases file.")
+    return pd.DataFrame({"prompt": prompts, "session_inputs": session_inputs})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--resource", required=True, help="projects/.../reasoningEngines/ID")
@@ -55,18 +97,39 @@ def main() -> None:
     parser.add_argument("--out", default="logs/agent-engine-eval-report.json")
     parser.add_argument(
         "--cases",
-        default="scripts/evals/hallucination_guardrail_cases.json",
+        default="scripts/evals/agent_engine_eval_cases.json",
         help="Path to JSON eval cases",
+    )
+    parser.add_argument(
+        "--publish-to-vertex",
+        action="store_true",
+        help="Create a Vertex evaluation run (shows under Evaluation tab)",
+    )
+    parser.add_argument("--gcs-dest", help="gs://... destination for Vertex evaluation artifacts")
+    parser.add_argument("--display-name", help="Display name for the Vertex evaluation run")
+    parser.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        help="Label for eval run as key=value (repeatable)",
     )
     args = parser.parse_args()
 
     if not args.project:
         raise SystemExit("Set --project or GOOGLE_CLOUD_PROJECT.")
+    if args.publish_to_vertex and not args.gcs_dest:
+        raise SystemExit("--gcs-dest is required when --publish-to-vertex is set.")
 
     cases = load_cases(args.cases)
+    labels = parse_labels(args.label)
 
     vertexai.init(project=args.project, location=args.location)
     engine = agent_engines.get(args.resource)
+    eval_client = Client(
+        project=args.project,
+        location=args.location,
+        http_options=genai_types.HttpOptions(api_version="v1beta1"),
+    )
 
     rows: list[dict] = []
     for case in cases:
@@ -95,6 +158,20 @@ def main() -> None:
             }
         )
 
+    eval_run_name: str | None = None
+    if args.publish_to_vertex:
+        dataset = build_eval_dataset(cases)
+        inferred_dataset = eval_client.evals.run_inference(agent=args.resource, src=dataset)
+        eval_run = eval_client.evals.create_evaluation_run(
+            dataset=inferred_dataset,
+            agent=args.resource,
+            metrics=default_metrics(),
+            dest=args.gcs_dest,
+            display_name=args.display_name,
+            labels=labels if labels else None,
+        )
+        eval_run_name = eval_run.name
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -102,15 +179,21 @@ def main() -> None:
         "project": args.project,
         "location": args.location,
         "resource": args.resource,
+        "vertex_eval_published": bool(args.publish_to_vertex),
+        "vertex_eval_run_name": eval_run_name,
+        "vertex_eval_display_name": args.display_name,
+        "vertex_eval_labels": labels,
+        "vertex_eval_gcs_dest": args.gcs_dest,
         "cases": rows,
-        "note": (
-            "This harness records baseline responses and sessions. "
-            "Use these cases in your Colab/SDK evaluation workflow to create console evaluation runs."
-        ),
+        "note": "This harness records baseline responses and can publish a Vertex evaluation run.",
     }
     out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote evaluation baseline report: {out}")
-    print("You can now use these cases in your Vertex evaluation notebook/SDK flow.")
+    if eval_run_name:
+        print(f"Created Vertex evaluation run: {eval_run_name}")
+        print("Check the Agent Engine Evaluation tab after the run is processed.")
+    else:
+        print("Baseline-only mode. Re-run with --publish-to-vertex and --gcs-dest to populate Evaluation tab.")
 
 
 if __name__ == "__main__":

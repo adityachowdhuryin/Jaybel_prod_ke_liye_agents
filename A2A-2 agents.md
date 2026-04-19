@@ -127,3 +127,27 @@ Configured source:
 - Sidebar session history/new/delete/pagination: implemented
 - Schema introspection against live BigQuery view: implemented
 - Structured routing + structured SQL generation + guardrails: implemented
+
+## 10) Agent Engine Observability Seeding (Memories + Evaluation)
+
+To ensure Agent Engine console tabs are populated with real data:
+
+- Memory seeding (Sessions/Traces/Memories):
+  - `scripts/agent-engine-memory-smoke.py`
+  - Supports multiple engine resources in one run.
+  - Uses reusable multi-turn scenarios from `scripts/evals/memory_seed_cases.json`.
+  - Writes run metadata to `logs/agent-engine-memory-seed-report-*.json`.
+
+- Evaluation publishing (Evaluation tab):
+  - `scripts/agent-engine-create-eval.py`
+  - Uses reusable eval prompts from `scripts/evals/agent_engine_eval_cases.json`.
+  - `--publish-to-vertex --gcs-dest gs://...` creates actual evaluation runs in Vertex.
+  - Writes local baseline + run metadata to `logs/agent-engine-eval-*.json`.
+
+- One-command orchestration:
+  - macOS/Linux: `scripts/seed-agent-engine-observability.sh`
+  - Windows: `scripts/seed-agent-engine-observability.ps1`
+  - Required env vars:
+    - `ORCHESTRATOR_AGENT_ENGINE_RESOURCE`
+    - `COST_AGENT_ENGINE_RESOURCE`
+    - `AGENT_ENGINE_EVAL_GCS_DEST`
