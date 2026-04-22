@@ -282,6 +282,8 @@ root_agent = LlmAgent(
     model="gemini-2.5-flash",
     instruction=(
         "You are a cloud cost analyst. For cost answers, use query_cloud_costs as the source of truth. "
+        "MANDATORY: call query_cloud_costs for every user turn that mentions or implies spend, cost, compare, services, time periods, or rankings (including one-word or vague asks such as 'Compare spend.' with no time window or entities). "
+        "Do not answer from prior knowledge, templates, or generic cost advice before the tool has run. "
         "You may also answer schema questions about the configured billing BigQuery source, such as listing columns, checking whether a column exists, or listing distinct values for a valid column. "
         "Never invent values, services, currencies, date windows, rankings, or trends. "
         "Never confuse normalized output fields with the actual BigQuery view schema. "

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import warnings
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -268,6 +269,87 @@ def _missing_required_slots(
     return missing
 
 
+def _sanitized_str(s: str | None) -> str | None:
+    t = (s or "").strip()
+    if not t or t.lower() in ("null", "none", "undefined"):
+        return None
+    return t
+
+
+def _apply_deterministic_slot_overrides(
+    message: str,
+    today: date,
+    scope: str,
+    *,
+    window_from_payload: bool,
+    ws: date | None,
+    we: date | None,
+    resolved_slots: dict[str, Any],
+    required_slots: list[str],
+    missing_slots: list[str],
+) -> tuple[str, bool, date | None, date | None, dict[str, Any], list[str], list[str]]:
+    """Remove false-positive missing slots (explicit top-N, compare pair, time window)."""
+    msg = message
+    m_lower = " ".join(msg.lower().split())
+    rslots: dict[str, Any] = dict(resolved_slots)
+    rreq = list(required_slots)
+    miss = list(missing_slots)
+    scope_out = scope
+    wf, w0, w1 = window_from_payload, ws, we
+
+    m_top = re.search(r"\btop\s*(\d+)\b", msg, re.IGNORECASE)
+    if m_top:
+        rslots["top_n"] = m_top.group(1)
+        miss = [s for s in miss if s != "top_n"]
+        rreq = [s for s in rreq if s != "top_n"]
+
+    m_days = re.search(r"\blast\s+(\d+)\s+days?\b", m_lower)
+    if m_days:
+        n = int(m_days.group(1))
+        w1 = today
+        w0 = today - timedelta(days=n - 1)
+        wf = True
+        rslots["time_window"] = f"last {n} days"
+        miss = [s for s in miss if s != "time_window"]
+        rreq = [s for s in rreq if s != "time_window"]
+        if scope_out in ("", "unsure"):
+            scope_out = "explicit_window"
+
+    if re.search(r"\bthis month\b", m_lower) and not wf:
+        w0 = date(today.year, today.month, 1)
+        w1 = today
+        wf = True
+        rslots["time_window"] = "this month (month-to-date)"
+        miss = [s for s in miss if s != "time_window"]
+        rreq = [s for s in rreq if s != "time_window"]
+        if scope_out in ("", "unsure"):
+            scope_out = "month_to_date"
+
+    gcp_a = re.search(r"cloud\s*sql", m_lower) is not None
+    gcp_b = re.search(r"vertex(?:\s*ai)?", m_lower) is not None
+    if gcp_a and gcp_b:
+        rslots.setdefault("service_a", "Cloud SQL")
+        rslots.setdefault("service_b", "Vertex AI")
+        for sname in ("compare_scope", "compare_entities"):
+            miss = [s for s in miss if s != sname]
+            rreq = [s for s in rreq if s != sname]
+
+    if rslots.get("service_a") and rslots.get("service_b"):
+        for sname in ("compare_scope", "compare_entities"):
+            miss = [s for s in miss if s != sname]
+            rreq = [s for s in rreq if s != sname]
+
+    return (
+        scope_out,
+        wf,
+        w0,
+        w1,
+        rslots,
+        rreq,
+        miss,
+    )
+
+
 def _clarification_for_slot(slot: str) -> tuple[str, list[str], str]:
     if slot == "top_n":
         return (
@@ -381,7 +463,7 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
             we = None
     intent = _normalized_intent(payload, message)
     required_slots = _slot_list(payload.required_slots)
-    resolved_slots = payload.resolved_slots if isinstance(payload.resolved_slots, dict) else {}
+    resolved_slots = dict(payload.resolved_slots if isinstance(payload.resolved_slots, dict) else {})
     if not required_slots:
         if intent == "top_n_ranking":
             required_slots = ["top_n", "time_window"]
@@ -395,13 +477,39 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
     missing_slots = _slot_list(payload.missing_slots)
     if not missing_slots:
         missing_slots = _missing_required_slots(required_slots, resolved_slots, window_resolved=window_resolved)
-    needs_clarification = bool(payload.needs_clarification) or bool(missing_slots)
+    (
+        scope,
+        window_from_payload,
+        ws,
+        we,
+        resolved_slots,
+        required_slots,
+        missing_slots,
+    ) = _apply_deterministic_slot_overrides(
+        message,
+        today,
+        scope,
+        window_from_payload=window_from_payload,
+        ws=ws,
+        we=we,
+        resolved_slots=resolved_slots,
+        required_slots=required_slots,
+        missing_slots=missing_slots,
+    )
+    has_time_scope = scope in {"month_to_date", "mtd", "full_history_to_date"}
+    resolved_time_window = str(resolved_slots.get("time_window") or "").strip()
+    window_resolved = window_from_payload or has_time_scope or bool(resolved_time_window)
+    missing_slots = _missing_required_slots(required_slots, resolved_slots, window_resolved=window_resolved)
+    needs_clarification = bool(missing_slots)
     clarification_priority = (payload.clarification_priority or "").strip().lower() or None
+    if clarification_priority in ("null", "none", "undefined", ""):
+        clarification_priority = None
     if needs_clarification and not clarification_priority:
         clarification_priority = missing_slots[0] if missing_slots else None
-    clarification_question = (payload.clarification_question or "").strip() or None
+    clarification_question = _sanitized_str((payload.clarification_question or "").strip() or None)
     clarification_options = [str(x).strip() for x in (payload.clarification_options or []) if str(x).strip()]
-    clarification_kind = (payload.clarification_kind or "").strip() or None
+    kind_raw = _sanitized_str((payload.clarification_kind or "").strip() or None)
+    clarification_kind = kind_raw
     if needs_clarification and clarification_priority and not clarification_question:
         clarification_question, clarification_options, clarification_kind = _clarification_for_slot(clarification_priority)
     if needs_clarification and clarification_priority and not clarification_kind:
@@ -442,7 +550,7 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
         billing_project_id=(payload.billing_project_id or "").strip().lower() or None,
         billing_region=(payload.billing_region or "").strip().lower() or None,
         wants_total=bool(payload.wants_total),
-        wants_top=bool(payload.wants_top),
+        wants_top=bool(payload.wants_top) or bool(str(resolved_slots.get("top_n") or "").strip()),
         needs_clarification=needs_clarification,
         clarification_question=clarification_question,
         clarification_options=clarification_options,
