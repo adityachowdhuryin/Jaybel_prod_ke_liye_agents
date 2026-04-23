@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://a2a.local/schemas/golden_dataset_schema.json",
+  "title": "Agent Engine Golden Dataset",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["id", "category", "priority", "expected_mode"],
+    "properties": {
+      "id": { "type": "string", "minLength": 1 },
+      "category": { "type": "string", "minLength": 1 },
+      "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
+      "tags": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "uniqueItems": true
+      },
+      "expected_mode": { "type": "string", "enum": ["clarify", "answer", "error"] },
+      "expected_response_type": {
+        "type": "string",
+        "enum": ["clarification", "result", "error", "text"]
+      },
+      "prompt": { "type": "string", "minLength": 1 },
+      "turns": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "minItems": 1
+      },
+      "must_contain_any": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "minItems": 1
+      },
+      "must_not_contain_any": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "minItems": 1
+      }
+    },
+    "oneOf": [
+      { "required": ["prompt"] },
+      { "required": ["turns"] }
+    ],
+    "additionalProperties": true
+  }
+}

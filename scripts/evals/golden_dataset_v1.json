@@ -1,0 +1,62 @@
+[
+  {
+    "id": "gdv1.clarify.top_services.no_top_n",
+    "category": "clarification",
+    "priority": "P0",
+    "tags": ["single_turn", "ranking"],
+    "prompt": "What are the most expensive services?",
+    "expected_mode": "clarify",
+    "expected_response_type": "clarification",
+    "must_contain_any": ["top 3", "top 5", "top 10", "how many results", "most expensive"]
+  },
+  {
+    "id": "gdv1.answer.this_year.cloud_sql.project",
+    "category": "time_interpretation",
+    "priority": "P0",
+    "tags": ["single_turn"],
+    "prompt": "What has been the total spend on Cloud SQL this year for jaybel-dev project?",
+    "expected_mode": "answer",
+    "expected_response_type": "result",
+    "must_not_contain_any": ["CLARIFICATION_REQUIRED", "What time window should I use"]
+  },
+  {
+    "id": "gdv1.answer.compare.services.last_30_days",
+    "category": "comparison",
+    "priority": "P0",
+    "tags": ["single_turn"],
+    "prompt": "Compare spend for Cloud SQL vs Vertex AI in the last 30 days.",
+    "expected_mode": "answer",
+    "expected_response_type": "result",
+    "must_not_contain_any": ["CLARIFICATION_REQUIRED", "What two scopes should I compare?"]
+  },
+  {
+    "id": "gdv1.error.unknown_column",
+    "category": "schema",
+    "priority": "P1",
+    "tags": ["single_turn", "schema"],
+    "prompt": "List all unique values in the fake_column_xyz column.",
+    "expected_mode": "error",
+    "expected_response_type": "error",
+    "must_contain_any": ["does not exist", "column", "cannot verify"]
+  },
+  {
+    "id": "gdv1.multiturn.fill_window",
+    "category": "clarification_chain",
+    "priority": "P0",
+    "tags": ["multi_turn"],
+    "turns": ["What did we spend on Cloud SQL?", "last 7 days"],
+    "expected_mode": "answer",
+    "expected_response_type": "result",
+    "must_not_contain_any": ["CLARIFICATION_REQUIRED", "What time window should I use"]
+  },
+  {
+    "id": "gdv1.multiturn.compare_scope_window",
+    "category": "clarification_chain",
+    "priority": "P0",
+    "tags": ["multi_turn", "comparison"],
+    "turns": ["Compare spend.", "cloud sql vs vertex ai", "last 30 days"],
+    "expected_mode": "answer",
+    "expected_response_type": "result",
+    "must_not_contain_any": ["What two scopes should I compare?", "CLARIFICATION_REQUIRED"]
+  }
+]
