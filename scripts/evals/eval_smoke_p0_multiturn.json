@@ -1,0 +1,59 @@
+[
+  {
+    "id": "mt.answer.top_services.top5.this_month",
+    "category": "clarification_flow",
+    "priority": "P0",
+    "turns": [
+      "What are the most expensive services?",
+      "Top 5 for this month."
+    ],
+    "expected_mode": "answer",
+    "expected_response_type": "result"
+  },
+  {
+    "id": "mt.answer.cloud_sql.last_7_days",
+    "category": "clarification_flow",
+    "priority": "P0",
+    "turns": [
+      "What did we spend on Cloud SQL?",
+      "Last 7 days."
+    ],
+    "expected_mode": "answer",
+    "expected_response_type": "result"
+  },
+  {
+    "id": "mt.answer.compare.services.last_30_days",
+    "category": "clarification_flow",
+    "priority": "P0",
+    "turns": [
+      "Compare spend.",
+      "Compare services: Cloud SQL vs Vertex AI in the last 30 days."
+    ],
+    "expected_mode": "answer",
+    "expected_response_type": "result"
+  },
+  {
+    "id": "mt.answer.compare.by_project.dev_vs_prod",
+    "category": "clarification_flow",
+    "priority": "P0",
+    "turns": [
+      "Compare spend.",
+      "Compare by project.",
+      "jaybel-dev vs jaybel-prod for this year."
+    ],
+    "expected_mode": "answer",
+    "expected_response_type": "result"
+  },
+  {
+    "id": "mt.answer.cloud_sql.top3.last_30_days",
+    "category": "clarification_flow",
+    "priority": "P0",
+    "turns": [
+      "Show most expensive Cloud SQL costs.",
+      "Top 3.",
+      "In the last 30 days."
+    ],
+    "expected_mode": "answer",
+    "expected_response_type": "result"
+  }
+]

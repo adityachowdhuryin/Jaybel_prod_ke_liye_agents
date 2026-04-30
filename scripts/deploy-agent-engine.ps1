@@ -92,6 +92,8 @@ try {
             "BILLING_BQ_SCHEMA_MODE=$BillingSchemaMode"
             "BILLING_DEFAULT_TILL_NOW_SCOPE=$BillingDefaultTillNowScope"
             "BILLING_FULL_HISTORY_START_DATE=$BillingFullHistoryStartDate"
+            "OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental"
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=EVENT_ONLY"
         )
         if ($db) {
             $lines += "DATABASE_URL=$db"

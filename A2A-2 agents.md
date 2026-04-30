@@ -190,3 +190,28 @@ To ensure Agent Engine console tabs are populated with real data:
     - `ORCHESTRATOR_AGENT_ENGINE_RESOURCE`
     - `COST_AGENT_ENGINE_RESOURCE`
     - `AGENT_ENGINE_EVAL_GCS_DEST`
+
+## 11) Online Monitoring (Cost Agent Only)
+
+Goal: continuously sample live production-like traffic (from chats routed through the
+deployed engines) and score the `cost_metrics_agent` in the Agent Engine console.
+
+- Setup script:
+  - macOS/Linux: `scripts/setup-agent-engine-online-monitor.sh`
+  - Windows: `scripts/setup-agent-engine-online-monitor.ps1`
+- Monitor defaults configured by the scripts:
+  - target: `COST_AGENT_ENGINE_RESOURCE` only
+  - sampling: `50%`
+  - metrics: `HALLUCINATION`, `FINAL_RESPONSE_QUALITY`, `TOOL_USE_QUALITY`, `SAFETY`
+  - optional run cap: `ONLINE_MONITOR_MAX_SAMPLES_PER_RUN` (default `200`)
+- Pre-checks before chatting:
+  - `python scripts/check-online-monitor-prereqs.py`
+  - requires `ORCHESTRATOR_LOCAL_CHAT=0` and `agent_engine_chat_enabled=true` in `/health`
+- Verification flow:
+  1. Configure monitor once with the setup script.
+  2. Chat through local Next.js UI (`/chat/stream` via local orchestrator bridge).
+  3. Open GCP Console → Agent Engine → cost agent → Evaluation → Online Monitors.
+  4. Confirm sampled traces and metric charts appear.
+- Expected delay:
+  - sampled traces usually appear within ~2-10 minutes
+  - metric aggregation commonly appears within ~10-30 minutes (can take longer during backend load)

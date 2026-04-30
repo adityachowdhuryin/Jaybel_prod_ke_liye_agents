@@ -118,3 +118,19 @@ Evaluation + Memories tabs
     - ORCHESTRATOR_AGENT_ENGINE_RESOURCE
     - COST_AGENT_ENGINE_RESOURCE
     - AGENT_ENGINE_EVAL_GCS_DEST
+
+Online Monitors (continuous scoring)
+------------------------------------
+- Configure cost agent online monitor only (50% sampling, 4 metrics) using:
+  - macOS/Linux: `scripts/setup-agent-engine-online-monitor.sh`
+  - Windows: `scripts/setup-agent-engine-online-monitor.ps1`
+- The setup is idempotent: updates existing monitor with same display name.
+- Metrics configured:
+  - `HALLUCINATION`
+  - `FINAL_RESPONSE_QUALITY`
+  - `TOOL_USE_QUALITY`
+  - `SAFETY`
+- Verify local routing prerequisites:
+  - `python scripts/check-online-monitor-prereqs.py`
+- After chatting via local UI, online-monitor results usually surface in
+  Agent Engine → Evaluation → Online Monitors within ~10-30 minutes.
