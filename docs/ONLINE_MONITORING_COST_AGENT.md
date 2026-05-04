@@ -4,6 +4,17 @@ This document records **everything done** in this repository and in GCP to enabl
 
 ---
 
+## 0) Quick start
+
+1. Ensure `config/gcp.env` has `ORCHESTRATOR_AGENT_ENGINE_RESOURCE`, `COST_AGENT_ENGINE_RESOURCE`, and `ORCHESTRATOR_LOCAL_CHAT=0`.
+2. Deploy cost agent (OTEL flags are injected by `scripts/deploy-agent-engine.sh` / `.ps1`):  
+   `./scripts/deploy-agent-engine.sh cost --agent-engine-id <ID>`
+3. Create or verify the monitor in **GCP Console → Agent Platform → `cost_metrics_agent` → Evaluation → Online monitors** (50% sampling, four metrics). Use automation only if `onlineEvaluators` API is healthy: `bash scripts/setup-agent-engine-online-monitor.sh`
+4. Run `python scripts/check-online-monitor-prereqs.py`, then chat from the UI or seed traffic.
+5. See **§6** for verification and **§5** for API troubleshooting.
+
+---
+
 ## 1) Goal
 
 - **Scope:** `cost_metrics_agent` only (not the orchestrator engine).
@@ -237,7 +248,8 @@ bash scripts/setup-agent-engine-online-monitor.sh
 
 Relevant commits pushed to `main` on `https://github.com/adityachowdhuryin/Orchestrator-and-Cost-agent` include:
 
-- **Online monitor tooling + docs + OTEL deploy wiring:** `231d56c` — `feat(observability): add cost-agent online monitor setup tooling`
+- **This guide (full narrative):** `8adcd8d` — `docs: add online monitoring guide for cost_metrics_agent`
+- **Online monitor tooling + partial docs + OTEL deploy wiring:** `231d56c` — `feat(observability): add cost-agent online monitor setup tooling`
 
 Earlier related work (eval cost tiers, etc.) remains in history as separate commits.
 

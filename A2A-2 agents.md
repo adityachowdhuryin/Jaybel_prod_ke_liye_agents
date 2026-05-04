@@ -193,6 +193,8 @@ To ensure Agent Engine console tabs are populated with real data:
 
 ## 11) Online Monitoring (Cost Agent Only)
 
+Full step-by-step narrative (telemetry, scripts, console vs API, troubleshooting): **`docs/ONLINE_MONITORING_COST_AGENT.md`**.
+
 Goal: continuously sample live production-like traffic (from chats routed through the
 deployed engines) and score the `cost_metrics_agent` in the Agent Engine console.
 
