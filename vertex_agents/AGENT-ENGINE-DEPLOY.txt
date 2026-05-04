@@ -121,7 +121,7 @@ Evaluation + Memories tabs
 
 Online Monitors (continuous scoring)
 ------------------------------------
-- Full guide: `docs/ONLINE_MONITORING_COST_AGENT.md`
+- Full guide: `docs/ONLINE_MONITORING_COST_AGENT.md` (includes §10 Firestore sync from Cloud Trace)
 - Configure cost agent online monitor only (50% sampling, 4 metrics) using:
   - macOS/Linux: `scripts/setup-agent-engine-online-monitor.sh`
   - Windows: `scripts/setup-agent-engine-online-monitor.ps1`

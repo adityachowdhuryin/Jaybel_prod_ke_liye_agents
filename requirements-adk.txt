@@ -4,5 +4,6 @@
 google-adk[a2a]>=1.27.0
 google-cloud-aiplatform>=1.70.0
 google-cloud-bigquery>=3.0.0
+google-cloud-firestore>=2.16.0
 # Local dev + cost_metrics_agent tools (Agent Engine also merges from agent requirements.txt)
 psycopg[binary]>=3.2

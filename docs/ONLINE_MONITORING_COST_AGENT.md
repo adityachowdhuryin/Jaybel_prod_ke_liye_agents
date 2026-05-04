@@ -268,7 +268,56 @@ Earlier related work (eval cost tiers, etc.) remains in history as separate comm
 
 ---
 
-## 10) Optional next steps
+## 10) Persist scores in Firestore (Cloud Trace source)
+
+Online monitor rubric scores are attached to **Cloud Trace** spans (not `evaluationRuns`). The repo includes a poller that lists traces for your monitor, parses metric labels on spans, and **upserts** one Firestore document per `trace_id`.
+
+**Scripts**
+
+| Script | Purpose |
+|--------|--------|
+| `scripts/sync-online-monitor-to-firestore.py` | Main logic: Trace API `list` + `COMPLETE` view, label parsing, Firestore writes. |
+| `scripts/sync-online-monitor-to-firestore.sh` | Loads `config/gcp.env`, runs Python from `.venv`. |
+| `scripts/sync-online-monitor-to-firestore.ps1` | Windows equivalent. |
+
+**Prerequisite:** the project must have a **Firestore Native** database (default `(default)` is fine). If reads fail with “database does not exist”, create one, for example:
+
+`gcloud firestore databases create --database='(default)' --location=us-central1 --type=firestore-native --project=YOUR_PROJECT_ID`
+
+**Configuration (env or flags)**
+
+- `ONLINE_EVALUATOR_RESOURCE` — full name, e.g. `projects/…/locations/us-central1/onlineEvaluators/4116571534393344000` (same string you use in Console → Traces).
+- Default Trace **list filter** is `+online_evaluator:"<full resource>"`, aligned with Cloud Logging’s `resource.labels.online_evaluator` troubleshooting field. If **list returns zero traces**, either set `ONLINE_EVAL_TRACE_FILTER` to the exact filter string from Trace Explorer / API (see `--dump-labels-trace-id` below), or use **`--scan-without-list-filter`**: list traces **without** a server-side filter (within the time window), then keep only traces whose span labels **mention** that evaluator resource (post-filter; caps with `--scan-max-list-traces`).
+- `ONLINE_EVAL_FIRESTORE_COLLECTION` (default `cost_agent_online_eval_traces`) — one document per trace, **document id = trace_id** (merge upsert).
+- Cursor doc: collection `online_eval_firestore_sync`, document `cost_agent_cursor` — stores `last_window_end` for incremental polling with overlap (`--overlap-minutes`, default 45).
+- Optional: `FIRESTORE_DATABASE_ID` for non-default Firestore database; `ONLINE_EVAL_METRIC_NAMES` to override the four default metric names.
+
+**IAM**
+
+- `cloudtrace.traces.list` and `cloudtrace.traces.get` (e.g. `roles/cloudtrace.user`).
+- Firestore write (e.g. `roles/datastore.user` on the project).
+
+**Debug**
+
+```bash
+python scripts/sync-online-monitor-to-firestore.py --project YOUR_PROJECT \
+  --dump-labels-trace-id TRACE_ID_HEX32
+```
+
+Prints full trace JSON (truncated) and every span label so you can tune `ONLINE_EVAL_TRACE_FILTER` or metric key heuristics.
+
+**Example run**
+
+```bash
+export ONLINE_EVALUATOR_RESOURCE='projects/gls-training-486405/locations/us-central1/onlineEvaluators/4116571534393344000'
+bash scripts/sync-online-monitor-to-firestore.sh --max-traces 50
+```
+
+Schedule with Cloud Scheduler → Cloud Run Job or cron; keep overlap so late-arriving traces are re-listed idempotently.
+
+---
+
+## 11) Optional next steps
 
 - When `onlineEvaluators` API is stable again, run `scripts/setup-agent-engine-online-monitor.sh` once to align **display name / caps** with repo defaults and avoid drift vs console-only config.
 - If you use multimodal payloads, consider GCS upload hooks for OTEL (see Google doc section on multimodal recording).

@@ -217,3 +217,4 @@ deployed engines) and score the `cost_metrics_agent` in the Agent Engine console
 - Expected delay:
   - sampled traces usually appear within ~2-10 minutes
   - metric aggregation commonly appears within ~10-30 minutes (can take longer during backend load)
+- Firestore archive of per-trace scores (Cloud Trace → Firestore): `scripts/sync-online-monitor-to-firestore.sh` — see **`docs/ONLINE_MONITORING_COST_AGENT.md` §10**.
