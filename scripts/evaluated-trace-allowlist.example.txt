@@ -1,0 +1,9 @@
+# One 32-char hex trace id per line (from Agent Platform → Traces while your online monitor filter is on).
+# Rename to e.g. config/evaluated-trace-allowlist.local.txt and point
+# ONLINE_EVAL_TRACE_ALLOWLIST_FILE or --evaluated-trace-allowlist-file at it.
+
+65bedd401748468f7bbaa776d338a446
+a473276f3138586f00e27aaf4404753e
+ee5d20f9ea8c36112d9c72f2ace88c2d
+76b31a2d7ce0cf8c56bf7eca1bf35242
+d1aee5fd6dcda7229ddf8503a3482c9a

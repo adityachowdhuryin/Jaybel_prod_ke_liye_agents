@@ -141,12 +141,83 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only merge --metrics-overrides into existing Firestore docs by trace_id (no Cloud Trace calls).",
     )
+    p.add_argument(
+        "--trace-ids-file",
+        default="",
+        metavar="PATH",
+        help="Newline-separated trace IDs (optional # comments). Appended to --trace-ids for direct GET ingest.",
+    )
+    p.add_argument(
+        "--evaluated-trace-allowlist-file",
+        default=os.environ.get("ONLINE_EVAL_TRACE_ALLOWLIST_FILE", "").strip(),
+        metavar="PATH",
+        help=(
+            "List crawl only (ignored with --trace-ids / --trace-ids-file): only upsert trace_ids "
+            "present in this file (one hex id per line); copy from Agent Platform Traces with your "
+            "online monitor filter active. Or set ONLINE_EVAL_TRACE_ALLOWLIST_FILE."
+        ),
+    )
+    p.add_argument(
+        "--include-non-evaluated-agent-traces",
+        action="store_true",
+        help=(
+            "With --scan-without-list-filter + --scan-gen-ai-agent-name, also write traces that have no "
+            "online_evaluator span label and no rubric labels (legacy behavior). Default is to skip those."
+        ),
+    )
+    p.add_argument(
+        "--prune-firestore-except-allowlist-file",
+        default="",
+        metavar="PATH",
+        help=(
+            "Delete Firestore documents in --collection whose document ID is not listed in this file "
+            "(same newline format as evaluated-trace-allowlist). Use --dry-run to print IDs that would be removed."
+        ),
+    )
     return p.parse_args()
 
 
 _RESERVED_METRICS_OVERRIDE_KEYS = frozenset(
     {"metrics", "provenance", "metrics_vertex_names", "metric_rationales", "metrics_note"}
 )
+
+
+def _load_trace_ids_file(path: str) -> list[str]:
+    raw = Path(path.strip()).read_text(encoding="utf-8")
+    out: list[str] = []
+    seen: set[str] = set()
+    for ln in raw.splitlines():
+        t = ln.split("#", 1)[0].strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def _load_trace_id_allowlist(path: str) -> set[str]:
+    return set(_load_trace_ids_file(path))
+
+
+def _should_persist_list_crawl_trace(
+    trace_id: str,
+    tr: dict[str, Any],
+    evaluator_resource: str,
+    extracted: dict[str, Any],
+    overrides: dict[str, Any],
+    *,
+    include_non_evaluated_agent_traces: bool,
+) -> bool:
+    """Skip gen_ai-only traces unless evaluator/metrics/overrides match (see --include-non-evaluated-agent-traces)."""
+    if include_non_evaluated_agent_traces:
+        return True
+    if trace_id in overrides:
+        return True
+    if evaluator_resource.strip() and _trace_matches_online_evaluator(tr, evaluator_resource):
+        return True
+    if extracted.get("metrics") or extracted.get("rationales"):
+        return True
+    return False
 
 
 def _load_metrics_overrides(path: str) -> dict[str, Any]:
@@ -470,9 +541,47 @@ def main() -> None:
         print(f"Patched metrics on {n} document(s) in {args.collection!r}.", file=sys.stderr)
         return
 
+    prune_path = args.prune_firestore_except_allowlist_file.strip()
+    if prune_path:
+        keep = _load_trace_id_allowlist(prune_path)
+        try:
+            db_prune = _firestore_client(project, args.firestore_database)
+        except gcp_exceptions.NotFound as exc:
+            raise SystemExit(
+                "Firestore has no database in this project (or wrong FIRESTORE_DATABASE_ID). "
+                f"Underlying error: {exc}"
+            ) from exc
+        n_del = 0
+        for doc in db_prune.collection(args.collection).stream():
+            if doc.id in keep:
+                continue
+            if args.dry_run:
+                print(f"prune (dry-run): would delete document id={doc.id!r}", file=sys.stderr)
+            else:
+                doc.reference.delete()
+            n_del += 1
+        print(
+            f"Prune: {'would remove' if args.dry_run else 'removed'} {n_del} document(s) "
+            f"not in {len(keep)} allowlisted id(s) from {prune_path!r}.",
+            file=sys.stderr,
+        )
+        return
+
     ev = args.online_evaluator.strip()
     trace_filter: str | None
     trace_ids_direct = [x.strip() for x in str(args.trace_ids or "").split(",") if x.strip()]
+    if args.trace_ids_file.strip():
+        trace_ids_direct.extend(_load_trace_ids_file(args.trace_ids_file))
+    _seen_ids: set[str] = set()
+    trace_ids_direct = [x for x in trace_ids_direct if not (x in _seen_ids or _seen_ids.add(x))]
+
+    eval_allowlist: set[str] | None = None
+    if args.evaluated_trace_allowlist_file.strip():
+        eval_allowlist = _load_trace_id_allowlist(args.evaluated_trace_allowlist_file)
+        print(
+            f"  evaluated-trace-allowlist: {len(eval_allowlist)} id(s) from {args.evaluated_trace_allowlist_file!r}",
+            file=sys.stderr,
+        )
 
     if args.scan_without_list_filter:
         if not ev and not args.scan_gen_ai_agent_name.strip():
@@ -610,9 +719,28 @@ def main() -> None:
                 continue
 
             extracted = _extract_evaluation_fields(tr, metric_names)
+            if eval_allowlist is not None:
+                if trace_id not in eval_allowlist:
+                    continue
+            elif not _should_persist_list_crawl_trace(
+                trace_id,
+                tr,
+                ev,
+                extracted,
+                overrides,
+                include_non_evaluated_agent_traces=args.include_non_evaluated_agent_traces,
+            ):
+                continue
+
             if not extracted["metrics"] and not extracted["rationales"]:
                 # Still persist stub so we know trace matched filter but parser needs tuning.
                 pass
+
+            ingest_path = "list_crawl"
+            if eval_allowlist is not None:
+                ingest_path = "list_crawl_eval_allowlist"
+            elif args.scan_without_list_filter:
+                ingest_path = "list_crawl_scan"
 
             doc = {
                 "trace_id": trace_id,
@@ -626,6 +754,7 @@ def main() -> None:
                 "root_span_start_time": extracted["root_span_start_time"],
                 "root_span_end_time": extracted["root_span_end_time"],
                 "source": "cloud_trace_online_monitor",
+                "ingest_path": ingest_path,
             }
             if db is not None:
                 doc["ingested_at"] = firestore.SERVER_TIMESTAMP

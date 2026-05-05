@@ -328,7 +328,16 @@ bash scripts/sync-online-monitor-to-firestore.sh \
   --max-traces 200
 ```
 
-Optional: `--trace-ids 'id1,id2'` fetches those trace IDs with `GET` and upserts Firestore (then exits). Add `--update-cursor-after-backfill` if you want to move the incremental cursor after a backfill.
+Optional: `--trace-ids 'id1,id2'` (or `--trace-ids-file PATH` with one hex id per line) fetches those trace IDs with `GET` and upserts Firestore (then exits). Add `--update-cursor-after-backfill` if you want to move the incremental cursor after a backfill.
+
+**Firestore only for “evaluated” traces (match the Console Traces sidebar filter):**
+
+1. **List crawl with an ID allowlist** — Paste the trace IDs from Agent Platform (online monitor filter on), one per line, into a file and run with  
+   `--evaluated-trace-allowlist-file PATH`. Only those IDs are upserted from the Cloud Trace `list` results in the time window.
+2. **Drop gen_ai-only noise** — With `--scan-without-list-filter` + `--scan-gen-ai-agent-name`, the default is to **skip** traces that have no online-evaluator span label and no rubric labels (unless they appear in `--metrics-overrides`). Use `--include-non-evaluated-agent-traces` only if you want the old broader behavior.
+3. **Prune Firestore** — After tightening ingest, remove documents that are not on your golden list:  
+   `--prune-firestore-except-allowlist-file PATH` (use `--dry-run` first to print ids that would be deleted). That command deletes and exits (it does not run a sync in the same invocation).
+4. **Metrics on every stored trace** — Add each `trace_id` to your `--metrics-overrides` JSON (from the Evaluation tab) and run `--apply-metrics-overrides-only` or merge during sync.
 
 **Why `metrics` can be `{}`:** The **Agent Platform / Console Evaluation** tab loads scores from an internal path. **`cloudtrace.googleapis.com` v1 trace JSON** for the same `traceId` typically has **no** `HALLUCINATION` / `SAFETY` / etc. span labels, and **Cloud Monitoring’s** `aiplatform.googleapis.com/online_evaluator/scores` series is **aggregated** (no `trace_id` label), so this repo cannot infer per-trace numbers from those APIs alone.
 
