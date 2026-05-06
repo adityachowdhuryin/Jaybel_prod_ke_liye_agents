@@ -22,7 +22,11 @@ SCHEDULE="${ONLINE_EVAL_SYNC_SCHEDULE:-0 0 * * *}"
 TIME_ZONE="${ONLINE_EVAL_SYNC_TIME_ZONE:-Etc/UTC}"
 COLLECTION="${ONLINE_EVAL_FIRESTORE_COLLECTION:-cost_agent_online_eval_traces}"
 ONLINE_EVALUATOR_RESOURCE="${ONLINE_EVALUATOR_RESOURCE:-}"
-SCAN_AGENT_NAME="${ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME:-cost_metrics_agent}"
+# Optional: widen scan post-filter to traces with gen_ai.agent.name (--scan-gen-ai-agent-name).
+# Omit (default empty) so only traces whose spans reference the monitor are ingested (~evaluated/sampled path).
+SCAN_AGENT_NAME="${ONLINE_EVAL_SYNC_SCAN_GEN_AI_AGENT_NAME:-}"
+# Set to 1 only if SCAN_AGENT_NAME is set and Trace export lacks evaluator labels; ingests noisy agent stubs.
+INCLUDE_AGENT_WITHOUT_EVAL_LABELS="${ONLINE_EVAL_SYNC_INCLUDE_AGENT_TRACES_WITHOUT_EVAL_LABELS:-0}"
 SCAN_MAX_LIST_TRACES="${ONLINE_EVAL_SYNC_SCAN_MAX_LIST_TRACES:-3000}"
 MAX_TRACES="${ONLINE_EVAL_SYNC_MAX_TRACES:-200}"
 PAGE_SIZE="${ONLINE_EVAL_SYNC_PAGE_SIZE:-50}"
@@ -79,7 +83,37 @@ else
     .
 fi
 
-echo "Deploying Cloud Run Job ${JOB_NAME} (scan mode: no Trace list filter; post-filter by evaluator + ${SCAN_AGENT_NAME})..."
+FILTER_DESC="post-filter: spans mention online evaluator only"
+if [[ -n "${SCAN_AGENT_NAME}" ]]; then
+  FILTER_DESC="post-filter: online evaluator spans OR gen_ai.agent.name=${SCAN_AGENT_NAME}"
+fi
+
+echo "Deploying Cloud Run Job ${JOB_NAME} (scan mode: no Trace list filter; ${FILTER_DESC})."
+DEPLOY_ENV=( "GOOGLE_CLOUD_PROJECT=${PROJECT}" "ONLINE_EVALUATOR_RESOURCE=${ONLINE_EVALUATOR_RESOURCE}" "ONLINE_EVAL_FIRESTORE_COLLECTION=${COLLECTION}" )
+if [[ -n "${SCAN_AGENT_NAME}" ]]; then
+  DEPLOY_ENV+=( "ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME=${SCAN_AGENT_NAME}" )
+fi
+JOINED_ENV=$(IFS=,; echo "${DEPLOY_ENV[*]}")
+
+JOB_ARGS=(
+  "--project=${PROJECT}"
+  "--online-evaluator=${ONLINE_EVALUATOR_RESOURCE}"
+  "--collection=${COLLECTION}"
+  "--scan-without-list-filter"
+  "--scan-max-list-traces=${SCAN_MAX_LIST_TRACES}"
+  "--max-traces=${MAX_TRACES}"
+  "--page-size=${PAGE_SIZE}"
+  "--lookback-minutes=${LOOKBACK_MINUTES}"
+  "--overlap-minutes=${OVERLAP_MINUTES}"
+)
+if [[ -n "${SCAN_AGENT_NAME}" ]]; then
+  JOB_ARGS+=("--scan-gen-ai-agent-name=${SCAN_AGENT_NAME}")
+fi
+if [[ "${INCLUDE_AGENT_WITHOUT_EVAL_LABELS}" == "1" ]]; then
+  JOB_ARGS+=("--include-non-evaluated-agent-traces")
+fi
+
+JOINED_ARGS=$(IFS=,; echo "${JOB_ARGS[*]}")
 gcloud run jobs deploy "$JOB_NAME" \
   --project "$PROJECT" \
   --region "$REGION" \
@@ -87,8 +121,8 @@ gcloud run jobs deploy "$JOB_NAME" \
   --service-account "$RUNTIME_SA" \
   --task-timeout="${TASK_TIMEOUT}" \
   --max-retries=1 \
-  --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT},ONLINE_EVALUATOR_RESOURCE=${ONLINE_EVALUATOR_RESOURCE},ONLINE_EVAL_FIRESTORE_COLLECTION=${COLLECTION},ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME=${SCAN_AGENT_NAME}" \
-  --args=--project="${PROJECT}",--online-evaluator="${ONLINE_EVALUATOR_RESOURCE}",--collection="${COLLECTION}",--scan-without-list-filter,--scan-gen-ai-agent-name="${SCAN_AGENT_NAME}",--scan-max-list-traces="${SCAN_MAX_LIST_TRACES}",--max-traces="${MAX_TRACES}",--page-size="${PAGE_SIZE}",--lookback-minutes="${LOOKBACK_MINUTES}",--overlap-minutes="${OVERLAP_MINUTES}",--include-non-evaluated-agent-traces
+  --set-env-vars "${JOINED_ENV}" \
+  --args="${JOINED_ARGS}"
 
 echo "Granting Scheduler invoker role on the job..."
 gcloud run jobs add-iam-policy-binding "$JOB_NAME" --project "$PROJECT" --region "$REGION" --member="serviceAccount:${SCHEDULER_INVOKER_SA}" --role="roles/run.invoker" >/dev/null

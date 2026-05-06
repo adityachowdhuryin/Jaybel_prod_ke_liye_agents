@@ -24,7 +24,8 @@ if (-not $env:ONLINE_EVALUATOR_RESOURCE) {
 $Collection = if ($env:ONLINE_EVAL_FIRESTORE_COLLECTION) { $env:ONLINE_EVAL_FIRESTORE_COLLECTION } else { "cost_agent_online_eval_traces" }
 $RuntimeSa = if ($env:ONLINE_EVAL_SYNC_RUNTIME_SA) { $env:ONLINE_EVAL_SYNC_RUNTIME_SA } else { "online-eval-sync-sa@$Project.iam.gserviceaccount.com" }
 $SchedulerSa = if ($env:ONLINE_EVAL_SYNC_SCHEDULER_INVOKER_SA) { $env:ONLINE_EVAL_SYNC_SCHEDULER_INVOKER_SA } else { "online-eval-sync-scheduler@$Project.iam.gserviceaccount.com" }
-$ScanAgentName = if ($env:ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME) { $env:ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME } else { "cost_metrics_agent" }
+$ScanAgentName = if ($env:ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME) { $env:ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME } else { "" }
+$IncludeAgentWithoutEvalLabels = ($env:ONLINE_EVAL_SYNC_INCLUDE_AGENT_TRACES_WITHOUT_EVAL_LABELS -eq "1")
 $ArRepo = if ($env:ONLINE_EVAL_SYNC_AR_REPO) { $env:ONLINE_EVAL_SYNC_AR_REPO } else { "cloud-run-jobs" }
 $Image = "us-central1-docker.pkg.dev/$Project/$ArRepo/$JobName`:latest"
 $ScanMaxListTraces = if ($env:ONLINE_EVAL_SYNC_SCAN_MAX_LIST_TRACES) { $env:ONLINE_EVAL_SYNC_SCAN_MAX_LIST_TRACES } else { "3000" }
@@ -64,7 +65,40 @@ else {
   Write-Host "Skipping Cloud Build (ONLINE_EVAL_SYNC_SKIP_CLOUD_BUILD=1); reusing image $Image."
 }
 
-Write-Host "Deploying job (scan mode: post-filter evaluator + $ScanAgentName)."
+if ($ScanAgentName) {
+  Write-Host "Deploying job (scan mode; post-filter: evaluator OR gen_ai.agent.name=$ScanAgentName)."
+} else {
+  Write-Host "Deploying job (scan mode; post-filter: evaluator spans only — no gen_ai widener)."
+}
+
+$DeployEnv = @(
+  "GOOGLE_CLOUD_PROJECT=$Project",
+  "ONLINE_EVALUATOR_RESOURCE=$env:ONLINE_EVALUATOR_RESOURCE",
+  "ONLINE_EVAL_FIRESTORE_COLLECTION=$Collection"
+)
+if ($ScanAgentName) {
+  $DeployEnv += "ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME=$ScanAgentName"
+}
+$JoinedEnv = $DeployEnv -join ","
+
+$JobArgList = @(
+  "--project=$Project",
+  "--online-evaluator=$env:ONLINE_EVALUATOR_RESOURCE",
+  "--collection=$Collection",
+  "--scan-without-list-filter",
+  "--scan-max-list-traces=$ScanMaxListTraces",
+  "--max-traces=$MaxTraces",
+  "--page-size=$PageSize",
+  "--lookback-minutes=$Lookback",
+  "--overlap-minutes=$Overlap"
+)
+if ($ScanAgentName) {
+  $JobArgList += "--scan-gen-ai-agent-name=$ScanAgentName"
+}
+if ($IncludeAgentWithoutEvalLabels) {
+  $JobArgList += "--include-non-evaluated-agent-traces"
+}
+$JoinedArgs = $JobArgList -join ","
 
 gcloud run jobs deploy $JobName `
   --project $Project `
@@ -73,8 +107,8 @@ gcloud run jobs deploy $JobName `
   --service-account $RuntimeSa `
   --task-timeout $TaskTimeout `
   --max-retries 1 `
-  --set-env-vars "GOOGLE_CLOUD_PROJECT=$Project,ONLINE_EVALUATOR_RESOURCE=$env:ONLINE_EVALUATOR_RESOURCE,ONLINE_EVAL_FIRESTORE_COLLECTION=$Collection,ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME=$ScanAgentName" `
-  --args="--project=$Project,--online-evaluator=$env:ONLINE_EVALUATOR_RESOURCE,--collection=$Collection,--scan-without-list-filter,--scan-gen-ai-agent-name=$ScanAgentName,--scan-max-list-traces=$ScanMaxListTraces,--max-traces=$MaxTraces,--page-size=$PageSize,--lookback-minutes=$Lookback,--overlap-minutes=$Overlap,--include-non-evaluated-agent-traces"
+  --set-env-vars $JoinedEnv `
+  --args="$JoinedArgs"
 
 gcloud run jobs add-iam-policy-binding $JobName --project $Project --region $Region --member "serviceAccount:$SchedulerSa" --role roles/run.invoker *> $null
 
