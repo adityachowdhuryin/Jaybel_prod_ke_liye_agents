@@ -22,6 +22,12 @@ SCHEDULE="${ONLINE_EVAL_SYNC_SCHEDULE:-0 0 * * *}"
 TIME_ZONE="${ONLINE_EVAL_SYNC_TIME_ZONE:-Etc/UTC}"
 COLLECTION="${ONLINE_EVAL_FIRESTORE_COLLECTION:-cost_agent_online_eval_traces}"
 ONLINE_EVALUATOR_RESOURCE="${ONLINE_EVALUATOR_RESOURCE:-}"
+# Optional: merge metrics overrides on every run.
+# Recommended: point to a gs:// URI so updates don't require redeploys.
+OVERRIDES_BUCKET="${ONLINE_EVAL_OVERRIDES_BUCKET:-${PROJECT}-online-eval-overrides}"
+OVERRIDES_OBJECT="${ONLINE_EVAL_OVERRIDES_OBJECT:-online-eval-metrics-overrides.json}"
+METRICS_OVERRIDES_GS_URI="${ONLINE_EVAL_METRICS_OVERRIDES_GS_URI:-gs://${OVERRIDES_BUCKET}/${OVERRIDES_OBJECT}}"
+METRICS_OVERRIDES_PATH="${ONLINE_EVAL_METRICS_OVERRIDES_PATH:-${METRICS_OVERRIDES_GS_URI}}"
 # Optional: widen scan post-filter to traces with gen_ai.agent.name (--scan-gen-ai-agent-name).
 # Omit (default empty) so only traces whose spans reference the monitor are ingested (~evaluated/sampled path).
 SCAN_AGENT_NAME="${ONLINE_EVAL_SYNC_SCAN_GEN_AI_AGENT_NAME:-}"
@@ -71,6 +77,8 @@ echo "Granting runtime IAM roles..."
 gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${RUNTIME_SA}" --role="roles/cloudtrace.user" >/dev/null
 gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${RUNTIME_SA}" --role="roles/datastore.user" >/dev/null
 gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${RUNTIME_SA}" --role="roles/logging.logWriter" >/dev/null
+gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${RUNTIME_SA}" --role="roles/logging.viewer" >/dev/null
+gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:${RUNTIME_SA}" --role="roles/storage.objectViewer" >/dev/null
 
 if [[ "${SKIP_CLOUD_BUILD}" == "1" ]]; then
   echo "Skipping Cloud Build (ONLINE_EVAL_SYNC_SKIP_CLOUD_BUILD=1); reusing image ${IMAGE}."
@@ -93,12 +101,17 @@ DEPLOY_ENV=( "GOOGLE_CLOUD_PROJECT=${PROJECT}" "ONLINE_EVALUATOR_RESOURCE=${ONLI
 if [[ -n "${SCAN_AGENT_NAME}" ]]; then
   DEPLOY_ENV+=( "ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME=${SCAN_AGENT_NAME}" )
 fi
+# If the baked-in overrides file exists in the image, always set env so ad-hoc runs match scheduled runs.
+DEPLOY_ENV+=( "ONLINE_EVAL_METRICS_OVERRIDES_PATH=${METRICS_OVERRIDES_PATH}" )
 JOINED_ENV=$(IFS=,; echo "${DEPLOY_ENV[*]}")
 
 JOB_ARGS=(
   "--project=${PROJECT}"
   "--online-evaluator=${ONLINE_EVALUATOR_RESOURCE}"
   "--collection=${COLLECTION}"
+  "--metrics-overrides=${METRICS_OVERRIDES_PATH}"
+  "--only-keep-traces-with-metrics"
+  "--ingest-from-online-evaluator-logs"
   "--scan-without-list-filter"
   "--scan-max-list-traces=${SCAN_MAX_LIST_TRACES}"
   "--max-traces=${MAX_TRACES}"

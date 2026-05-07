@@ -3,6 +3,8 @@ logs/*.err.log
 .venv/
 config/gcp.env
 config/*.local.json
+config/*.allowlist
+config/online-eval-metrics-overrides.*.json
 vertex_agents/**/.env
 # Local Next.js env (use frontend/.env.example); may contain credential paths
 frontend/.env

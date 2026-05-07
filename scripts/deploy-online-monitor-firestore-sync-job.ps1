@@ -26,6 +26,10 @@ $RuntimeSa = if ($env:ONLINE_EVAL_SYNC_RUNTIME_SA) { $env:ONLINE_EVAL_SYNC_RUNTI
 $SchedulerSa = if ($env:ONLINE_EVAL_SYNC_SCHEDULER_INVOKER_SA) { $env:ONLINE_EVAL_SYNC_SCHEDULER_INVOKER_SA } else { "online-eval-sync-scheduler@$Project.iam.gserviceaccount.com" }
 $ScanAgentName = if ($env:ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME) { $env:ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME } else { "" }
 $IncludeAgentWithoutEvalLabels = ($env:ONLINE_EVAL_SYNC_INCLUDE_AGENT_TRACES_WITHOUT_EVAL_LABELS -eq "1")
+$OverridesBucket = if ($env:ONLINE_EVAL_OVERRIDES_BUCKET) { $env:ONLINE_EVAL_OVERRIDES_BUCKET } else { "$Project-online-eval-overrides" }
+$OverridesObject = if ($env:ONLINE_EVAL_OVERRIDES_OBJECT) { $env:ONLINE_EVAL_OVERRIDES_OBJECT } else { "online-eval-metrics-overrides.json" }
+$MetricsOverridesGsUri = if ($env:ONLINE_EVAL_METRICS_OVERRIDES_GS_URI) { $env:ONLINE_EVAL_METRICS_OVERRIDES_GS_URI } else { "gs://$OverridesBucket/$OverridesObject" }
+$MetricsOverridesPath = if ($env:ONLINE_EVAL_METRICS_OVERRIDES_PATH) { $env:ONLINE_EVAL_METRICS_OVERRIDES_PATH } else { $MetricsOverridesGsUri }
 $ArRepo = if ($env:ONLINE_EVAL_SYNC_AR_REPO) { $env:ONLINE_EVAL_SYNC_AR_REPO } else { "cloud-run-jobs" }
 $Image = "us-central1-docker.pkg.dev/$Project/$ArRepo/$JobName`:latest"
 $ScanMaxListTraces = if ($env:ONLINE_EVAL_SYNC_SCAN_MAX_LIST_TRACES) { $env:ONLINE_EVAL_SYNC_SCAN_MAX_LIST_TRACES } else { "3000" }
@@ -52,6 +56,8 @@ try { gcloud iam service-accounts describe $SchedulerSa --project $Project *> $n
 gcloud projects add-iam-policy-binding $Project --member "serviceAccount:$RuntimeSa" --role roles/cloudtrace.user *> $null
 gcloud projects add-iam-policy-binding $Project --member "serviceAccount:$RuntimeSa" --role roles/datastore.user *> $null
 gcloud projects add-iam-policy-binding $Project --member "serviceAccount:$RuntimeSa" --role roles/logging.logWriter *> $null
+gcloud projects add-iam-policy-binding $Project --member "serviceAccount:$RuntimeSa" --role roles/logging.viewer *> $null
+gcloud projects add-iam-policy-binding $Project --member "serviceAccount:$RuntimeSa" --role roles/storage.objectViewer *> $null
 
 if (-not $SkipCloudBuild) {
   Push-Location $RepoRoot
@@ -74,7 +80,8 @@ if ($ScanAgentName) {
 $DeployEnv = @(
   "GOOGLE_CLOUD_PROJECT=$Project",
   "ONLINE_EVALUATOR_RESOURCE=$env:ONLINE_EVALUATOR_RESOURCE",
-  "ONLINE_EVAL_FIRESTORE_COLLECTION=$Collection"
+  "ONLINE_EVAL_FIRESTORE_COLLECTION=$Collection",
+  "ONLINE_EVAL_METRICS_OVERRIDES_PATH=$MetricsOverridesPath"
 )
 if ($ScanAgentName) {
   $DeployEnv += "ONLINE_EVAL_SCAN_GEN_AI_AGENT_NAME=$ScanAgentName"
@@ -85,6 +92,9 @@ $JobArgList = @(
   "--project=$Project",
   "--online-evaluator=$env:ONLINE_EVALUATOR_RESOURCE",
   "--collection=$Collection",
+  "--metrics-overrides=$MetricsOverridesPath",
+  "--only-keep-traces-with-metrics",
+  "--ingest-from-online-evaluator-logs",
   "--scan-without-list-filter",
   "--scan-max-list-traces=$ScanMaxListTraces",
   "--max-traces=$MaxTraces",

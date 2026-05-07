@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-traces", type=int, default=200, help="Stop after persisting this many new traces.")
     p.add_argument("--page-size", type=int, default=50, help="Cloud Trace list page size (<=100 recommended).")
     p.add_argument("--dry-run", action="store_true", help="List and parse only; do not write Firestore.")
+    p.add_argument(
+        "--ingest-from-online-evaluator-logs",
+        action="store_true",
+        help=(
+            "Read evaluated trace scores from Cloud Logging (aiplatform.googleapis.com/online_evaluator) instead of "
+            "parsing Cloud Trace span labels. This is the only fully-automatic way to fetch per-trace rubric scores "
+            "when Trace export omits them. Writes only evaluated traces with scores."
+        ),
+    )
+    p.add_argument(
+        "--online-evaluator-log-lookback-minutes",
+        type=int,
+        default=720,
+        help=(
+            "With --ingest-from-online-evaluator-logs and no explicit --start-time/--end-time, how far back to query "
+            "Cloud Logging if no Firestore cursor exists (default 720 minutes)."
+        ),
+    )
     p.add_argument(
         "--dump-labels-trace-id",
         metavar="TRACE_ID",
@@ -166,6 +185,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--only-keep-traces-with-metrics",
+        action="store_true",
+        help=(
+            "After the run, delete Firestore documents in --collection whose `metrics` field is missing or empty. "
+            "During the run, skip writing new traces that would have empty metrics (after applying --metrics-overrides)."
+        ),
+    )
+    p.add_argument(
         "--prune-firestore-except-allowlist-file",
         default="",
         metavar="PATH",
@@ -173,6 +200,24 @@ def _parse_args() -> argparse.Namespace:
             "Delete Firestore documents in --collection whose document ID is not listed in this file "
             "(same newline format as evaluated-trace-allowlist). Use --dry-run to print IDs that would be removed."
         ),
+    )
+    p.add_argument(
+        "--explorer-reconcile-and-prune",
+        action="store_true",
+        help=(
+            "Align Firestore with Cloud Trace / Agent Platform explorer filtered view: paginate EVERY trace matching "
+            "the list API filter (--trace-filter or default +online_evaluator from --online-evaluator) between "
+            "--start-time and --end-time, upsert each, then DELETE Firestore documents in --collection not in that set. "
+            "Requires both time bounds (not incremental cursor mode). Incompatible with --scan-without-list-filter. "
+            "Stops pagination after --explorer-reconcile-max-pages unless all pages fetched."
+        ),
+    )
+    p.add_argument(
+        "--explorer-reconcile-max-pages",
+        type=int,
+        default=int(os.environ.get("ONLINE_EVAL_EXPLORER_RECONCILE_MAX_PAGES", "500")),
+        metavar="N",
+        help="Safety cap on Trace list pages for --explorer-reconcile-and-prune (default 500).",
     )
     return p.parse_args()
 
@@ -224,10 +269,34 @@ def _load_metrics_overrides(path: str) -> dict[str, Any]:
     p = path.strip()
     if not p:
         return {}
-    raw = json.loads(Path(p).read_text(encoding="utf-8"))
+    if p.startswith("gs://"):
+        raw_txt = _read_gcs_text(p)
+        raw = json.loads(raw_txt)
+    else:
+        raw = json.loads(Path(p).read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise SystemExit("--metrics-overrides file must be a JSON object mapping trace_id -> overrides")
     return raw
+
+
+def _read_gcs_text(gs_uri: str) -> str:
+    # Fetch object via JSON API with ADC credentials.
+    # Requires runtime identity to have roles/storage.objectViewer on the bucket (or equivalent).
+    m = re.match(r"^gs://([^/]+)/(.+)$", gs_uri.strip())
+    if not m:
+        raise SystemExit(f"Invalid GCS URI for --metrics-overrides: {gs_uri!r}")
+    bucket = m.group(1)
+    obj = m.group(2)
+    sess = _auth_session()
+    url = (
+        "https://storage.googleapis.com/storage/v1/b/"
+        + urllib.parse.quote(bucket, safe="")
+        + "/o/"
+        + urllib.parse.quote(obj, safe="")
+    )
+    r = sess.get(url, params={"alt": "media"}, timeout=120)
+    r.raise_for_status()
+    return r.text
 
 
 def _merge_metrics_overrides_into_doc(trace_id: str, doc: dict[str, Any], overrides: dict[str, Any]) -> None:
@@ -252,6 +321,155 @@ def _merge_metrics_overrides_into_doc(trace_id: str, doc: dict[str, Any], overri
         doc["metrics_note"] = str(raw["metrics_note"])
     if isinstance(raw.get("metric_rationales"), dict):
         doc["metric_rationales"] = raw["metric_rationales"]
+
+
+def _doc_has_populated_metrics(doc: dict[str, Any]) -> bool:
+    m = doc.get("metrics")
+    return isinstance(m, dict) and bool(m)
+
+
+_ONLINE_EVAL_LOG_NAME = "aiplatform.googleapis.com/online_evaluator"
+_ONLINE_EVAL_EVENT_NAME_KEY = "event.name"
+_ONLINE_EVAL_EVENT_NAME_VALUE = "gen_ai.evaluation.result"
+_ONLINE_EVAL_SCORE_NAME_KEY = "gen_ai.evaluation.name"
+_ONLINE_EVAL_SCORE_VALUE_KEY = "gen_ai.evaluation.score.value"
+
+
+def _vertex_metric_name_to_canonical(metric_name: str) -> str:
+    m = metric_name.strip().lower()
+    mapping = {
+        "hallucination_v1": "HALLUCINATION",
+        "final_response_quality_v1": "FINAL_RESPONSE_QUALITY",
+        "tool_use_quality_v1": "TOOL_USE_QUALITY",
+        "safety_v1": "SAFETY",
+    }
+    return mapping.get(m, metric_name.strip().upper() or metric_name)
+
+
+def _extract_trace_id_from_log_trace(trace_field: str) -> str | None:
+    # trace field example: "projects/<project>/traces/<traceId>"
+    s = (trace_field or "").strip()
+    m = re.search(r"/traces/([0-9a-f]{32})$", s)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _logging_entries_list(
+    sess: AuthorizedSession,
+    *,
+    project_id: str,
+    filter_str: str,
+    start_time: datetime,
+    end_time: datetime,
+    page_size: int,
+    page_token: str | None,
+) -> dict[str, Any]:
+    url = "https://logging.googleapis.com/v2/entries:list"
+    payload: dict[str, Any] = {
+        "resourceNames": [f"projects/{project_id}"],
+        "filter": filter_str,
+        "orderBy": "timestamp desc",
+        "pageSize": max(1, min(page_size, 1000)),
+    }
+    if page_token:
+        payload["pageToken"] = page_token
+    # Enforce window in filter (Cloud Logging filter language).
+    st = start_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    et = end_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    payload["filter"] = f'({filter_str}) AND timestamp>=\"{st}\" AND timestamp<=\"{et}\"'
+    r = sess.post(url, json=payload, timeout=120)
+    r.raise_for_status()
+    return r.json()
+
+
+def _collect_scores_from_online_evaluator_logs(
+    sess: AuthorizedSession,
+    *,
+    project_id: str,
+    online_evaluator_resource: str,
+    start_time: datetime,
+    end_time: datetime,
+    max_traces: int,
+    page_size: int = 1000,
+) -> dict[str, dict[str, Any]]:
+    """
+    Returns trace_id -> {"metrics_vertex_names": {...}, "metrics": {...}, "metric_rationales": {...}}.
+    Only includes traces with at least one score entry.
+    """
+    # NOTE: we rely on labels emitted by the online evaluator log.
+    escaped_ev = online_evaluator_resource.replace('"', '\\"')
+    log_name = urllib.parse.quote(_ONLINE_EVAL_LOG_NAME, safe="")
+    base_filter = (
+        f'logName="projects/{project_id}/logs/{log_name}" '
+        f'AND labels.online_evaluator="{escaped_ev}" '
+        f'AND labels."{_ONLINE_EVAL_EVENT_NAME_KEY}"="{_ONLINE_EVAL_EVENT_NAME_VALUE}"'
+    )
+    out: dict[str, dict[str, Any]] = {}
+    page_token: str | None = None
+    while True:
+        data = _logging_entries_list(
+            sess,
+            project_id=project_id,
+            filter_str=base_filter,
+            start_time=start_time,
+            end_time=end_time,
+            page_size=page_size,
+            page_token=page_token,
+        )
+        entries = data.get("entries") or []
+        page_token = str(data.get("nextPageToken") or "") or None
+        for e in entries:
+            trace_id = _extract_trace_id_from_log_trace(str(e.get("trace") or ""))
+            if not trace_id:
+                continue
+            labels = e.get("labels") or {}
+            if not isinstance(labels, dict):
+                continue
+            metric_name = str(labels.get(_ONLINE_EVAL_SCORE_NAME_KEY) or "").strip()
+            score_val = str(labels.get(_ONLINE_EVAL_SCORE_VALUE_KEY) or "").strip()
+            if not metric_name or not score_val:
+                continue
+            score_parsed = _try_parse_score(score_val)
+            doc = out.setdefault(
+                trace_id,
+                {"metrics_vertex_names": {}, "metrics": {}, "metric_rationales": {}},
+            )
+            mv = doc["metrics_vertex_names"]
+            if isinstance(mv, dict) and metric_name not in mv:
+                mv[metric_name] = score_parsed
+            canon = _vertex_metric_name_to_canonical(metric_name)
+            m = doc["metrics"]
+            if isinstance(m, dict) and canon not in m:
+                m[canon] = score_parsed
+
+            # Optional: try to pull rubric reasoning (if present) into metric_rationales
+            jp = e.get("jsonPayload") or {}
+            if isinstance(jp, dict):
+                cand = jp.get("candidateResult")
+                if isinstance(cand, dict):
+                    verdicts = cand.get("rubricVerdicts")
+                    if isinstance(verdicts, list):
+                        for v in verdicts:
+                            if not isinstance(v, dict):
+                                continue
+                            reasoning = v.get("reasoning")
+                            if isinstance(reasoning, str) and reasoning.strip():
+                                # Only store one rationale per metric name key.
+                                mr = doc["metric_rationales"]
+                                if isinstance(mr, dict) and metric_name not in mr:
+                                    mr[metric_name] = reasoning[:16000]
+                                break
+
+        # Stop if we have enough distinct traces (safety cap).
+        if len(out) >= max_traces:
+            break
+        if not page_token:
+            break
+        if not entries:
+            break
+    # Drop any empties just in case.
+    return {tid: d for tid, d in out.items() if _doc_has_populated_metrics(d)}
 
 
 def _parse_rfc3339_utc(s: str) -> datetime:
@@ -492,6 +710,50 @@ def _write_cursor(db: firestore.Client | None, end_time: datetime) -> None:
     db.collection(_SYNC_COLLECTION).document(_SYNC_DOC_ID).set(payload, merge=True)
 
 
+def _explorer_reconcile_collect_traces(
+    sess: AuthorizedSession,
+    *,
+    project_id: str,
+    start_time: datetime,
+    end_time: datetime,
+    trace_filter: str | None,
+    page_size: int,
+    max_pages: int,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Return dedup trace_id -> trace dict from Cloud Trace list (COMPLETE view); second value is pages read."""
+    by_id: dict[str, dict[str, Any]] = {}
+    page_token: str | None = None
+    pages_read = 0
+    while pages_read < max_pages:
+        pages_read += 1
+        data = _list_traces(
+            sess,
+            project_id=project_id,
+            start_time=start_time,
+            end_time=end_time,
+            trace_filter=trace_filter,
+            page_size=page_size,
+            page_token=page_token,
+        )
+        traces = data.get("traces") or []
+        page_token = str(data.get("nextPageToken") or "") or None
+        for tr in traces:
+            trace_id = str(tr.get("traceId") or "").strip()
+            if trace_id:
+                by_id[trace_id] = tr
+        if not page_token:
+            break
+        if not traces:
+            break
+    if pages_read >= max_pages and page_token:
+        print(
+            f"explorer-reconcile WARNING: pagination stopped after {max_pages} pages (NEXT_PAGE_TOKEN still set); "
+            f"Firestore prune may omit newer traces.",
+            file=sys.stderr,
+        )
+    return by_id, pages_read
+
+
 def _dump_trace_labels(sess: AuthorizedSession, *, project_id: str, trace_id: str) -> None:
     trace = _get_trace(sess, project_id=project_id, trace_id=trace_id)
     print(json.dumps(trace, indent=2, ensure_ascii=False)[:200000])
@@ -636,6 +898,179 @@ def main() -> None:
 
     metric_names = _metric_names_from_env()
 
+    # Log-driven ingest: evaluated traces + scores are sourced from Cloud Logging.
+    if args.ingest_from_online_evaluator_logs:
+        if not ev:
+            raise SystemExit("--ingest-from-online-evaluator-logs requires --online-evaluator / ONLINE_EVALUATOR_RESOURCE.")
+        # If no explicit range and no cursor, use a wider initial lookback for logs (evaluators run every ~10 minutes).
+        if not explicit_range and cursor is None:
+            start_time = end_time - timedelta(minutes=max(args.online_evaluator_log_lookback_minutes, 1))
+
+        print(f"Querying Online Evaluator logs project={project}", file=sys.stderr)
+        print(f"  window: {start_time.isoformat()} .. {end_time.isoformat()}", file=sys.stderr)
+        print(f"  online_evaluator: {ev}", file=sys.stderr)
+
+        scores_by_trace = _collect_scores_from_online_evaluator_logs(
+            sess,
+            project_id=project,
+            online_evaluator_resource=ev,
+            start_time=start_time,
+            end_time=end_time,
+            max_traces=args.max_traces,
+        )
+        trace_ids = sorted(scores_by_trace.keys())
+        if not trace_ids:
+            print("No evaluated traces with scores found in logs for this window.", file=sys.stderr)
+            # Still advance cursor in incremental mode to avoid requery loops (logs are authoritative for "evaluated").
+            should_cursor = db is not None and not args.dry_run and (not explicit_range or args.update_cursor_after_backfill)
+            if should_cursor:
+                _write_cursor(db, datetime.now(timezone.utc) if explicit_range else end_time)
+            return
+
+        written = 0
+        for trace_id in trace_ids[: args.max_traces]:
+            doc: dict[str, Any] = {
+                "trace_id": trace_id,
+                "project_id": project,
+                "online_evaluator_resource": ev,
+                "agent_resource": args.agent_resource.strip() or None,
+                "source": "aiplatform_online_evaluator_log",
+                "ingest_path": "online_evaluator_logs",
+                "metrics": scores_by_trace[trace_id].get("metrics") or {},
+                "metrics_vertex_names": scores_by_trace[trace_id].get("metrics_vertex_names") or {},
+                "metric_rationales": scores_by_trace[trace_id].get("metric_rationales") or None,
+                "metrics_provenance": "aiplatform_online_evaluator_log",
+            }
+
+            # Optional enrichment from Cloud Trace (root span timing). Best-effort.
+            try:
+                tr = _get_trace(sess, project_id=project, trace_id=trace_id)
+                extracted = _extract_evaluation_fields(tr, metric_names)
+                doc["root_span_start_time"] = extracted.get("root_span_start_time")
+                doc["root_span_end_time"] = extracted.get("root_span_end_time")
+                doc["matched_trace_label_keys"] = extracted.get("matched_label_keys")
+            except Exception:
+                pass
+
+            # Merge overrides if provided (still supported), then enforce metrics-only behavior.
+            _merge_metrics_overrides_into_doc(trace_id, doc, overrides)
+            doc = {k: v for k, v in doc.items() if v is not None}
+            if args.only_keep_traces_with_metrics and not _doc_has_populated_metrics(doc):
+                continue
+
+            if args.dry_run:
+                print(json.dumps({"trace_id": trace_id, "metrics": doc.get("metrics")}, ensure_ascii=False))
+                written += 1
+            else:
+                assert db is not None
+                doc_snapshot = dict(doc)
+                doc_snapshot["ingested_at"] = firestore.SERVER_TIMESTAMP
+                db.collection(args.collection).document(trace_id).set(doc_snapshot, merge=True)
+                written += 1
+
+        should_cursor = db is not None and not args.dry_run and (not explicit_range or args.update_cursor_after_backfill)
+        if should_cursor:
+            _write_cursor(db, datetime.now(timezone.utc) if explicit_range else end_time)
+
+        if args.only_keep_traces_with_metrics and db is not None:
+            removed = 0
+            for d in db.collection(args.collection).stream():
+                data = d.to_dict() or {}
+                if _doc_has_populated_metrics(data):
+                    continue
+                if args.dry_run:
+                    print(f"prune-empty-metrics (dry-run): would delete document id={d.id!r}", file=sys.stderr)
+                else:
+                    d.reference.delete()
+                removed += 1
+            print(f"prune-empty-metrics: {'would remove' if args.dry_run else 'removed'} {removed} document(s).", file=sys.stderr)
+
+        print(
+            f"Done. {'Would upsert' if args.dry_run else 'Upserted'} {written} evaluated trace document(s) into {args.collection!r}.",
+            file=sys.stderr,
+        )
+        return
+
+    if args.explorer_reconcile_and_prune:
+        if trace_ids_direct:
+            raise SystemExit("--explorer-reconcile-and-prune cannot be used with --trace-ids / --trace-ids-file.")
+        if args.evaluated_trace_allowlist_file.strip():
+            raise SystemExit("--explorer-reconcile-and-prune cannot be combined with --evaluated-trace-allowlist-file.")
+        if not explicit_range:
+            raise SystemExit("--explorer-reconcile-and-prune requires --start-time and --end-time.")
+        if args.scan_without_list_filter:
+            raise SystemExit("--explorer-reconcile-and-prune is incompatible with --scan-without-list-filter.")
+        if not trace_filter:
+            raise SystemExit("--explorer-reconcile-and-prune needs a Trace list filter (--trace-filter or --online-evaluator).")
+        explorer_by_id, pages_read = _explorer_reconcile_collect_traces(
+            sess,
+            project_id=project,
+            start_time=start_time,
+            end_time=end_time,
+            trace_filter=trace_filter,
+            page_size=args.page_size,
+            max_pages=max(args.explorer_reconcile_max_pages, 1),
+        )
+        explorer_ids = set(explorer_by_id.keys())
+        if not explorer_ids:
+            raise SystemExit(
+                "explorer-reconcile-and-prune: Trace list returned zero traces for this filter and window "
+                "(Console may still show rows if indexing differs). Aborting Firestore prune."
+            )
+        print(f"explorer-reconcile: collected {len(explorer_ids)} trace id(s), {pages_read} list page(s).", file=sys.stderr)
+        try:
+            prune_db = _firestore_client(project, args.firestore_database)
+        except gcp_exceptions.NotFound as exc:
+            raise SystemExit(f"Firestore not available for explorer reconcile prune: {exc}") from exc
+        upsert_written = 0
+        ev_res = args.online_evaluator.strip()
+        for trace_id in sorted(explorer_ids):
+            tr_payload = explorer_by_id[trace_id]
+            extracted = _extract_evaluation_fields(tr_payload, metric_names)
+            doc: dict[str, Any] = {
+                "trace_id": trace_id,
+                "project_id": project,
+                "online_evaluator_resource": ev_res or extracted.get("online_evaluator_from_trace"),
+                "agent_resource": args.agent_resource.strip() or None,
+                "metrics": extracted["metrics"],
+                "metric_rationales": extracted["rationales"] or None,
+                "matched_trace_label_keys": extracted["matched_label_keys"],
+                "root_span_start_time": extracted["root_span_start_time"],
+                "root_span_end_time": extracted["root_span_end_time"],
+                "source": "cloud_trace_online_monitor",
+                "ingest_path": "explorer_reconcile_prune",
+            }
+            _merge_metrics_overrides_into_doc(trace_id, doc, overrides)
+            doc = {k: v for k, v in doc.items() if v is not None}
+            if db is None:
+                print(json.dumps({"trace_id": trace_id, "metrics": doc.get("metrics")}, ensure_ascii=False))
+            else:
+                doc_snapshot = dict(doc)
+                doc_snapshot["ingested_at"] = firestore.SERVER_TIMESTAMP
+                prune_db.collection(args.collection).document(trace_id).set(doc_snapshot, merge=True)
+            upsert_written += 1
+        prune_deleted = 0
+        for fs_doc in prune_db.collection(args.collection).stream():
+            if fs_doc.id in explorer_ids:
+                continue
+            if args.dry_run:
+                print(f"explorer-reconcile prune (dry-run): would delete document id={fs_doc.id!r}", file=sys.stderr)
+            else:
+                fs_doc.reference.delete()
+            prune_deleted += 1
+        print(
+            f"explorer-reconcile: {'would upsert' if db is None else 'upserted'} {upsert_written} trace document(s); "
+            f"{'would remove' if args.dry_run else 'removed'} {prune_deleted} extra document(s) from "
+            f"{args.collection!r}.",
+            file=sys.stderr,
+        )
+        should_cursor = prune_db is not None and not args.dry_run and (
+            not explicit_range or args.update_cursor_after_backfill
+        )
+        if should_cursor:
+            _write_cursor(prune_db, datetime.now(timezone.utc) if explicit_range else end_time)
+        return
+
     total_written = 0
     page_token: str | None = None
     examined = 0
@@ -677,6 +1112,8 @@ def main() -> None:
                 doc["ingested_at"] = firestore.SERVER_TIMESTAMP
             _merge_metrics_overrides_into_doc(trace_id, doc, overrides)
             doc = {k: v for k, v in doc.items() if v is not None}
+            if args.only_keep_traces_with_metrics and not _doc_has_populated_metrics(doc):
+                continue
             if args.dry_run:
                 print(json.dumps({"trace_id": trace_id, "metrics": doc.get("metrics")}, ensure_ascii=False))
             else:
@@ -686,6 +1123,18 @@ def main() -> None:
         should_cursor = db is not None and not args.dry_run and (not explicit_range or args.update_cursor_after_backfill)
         if should_cursor:
             _write_cursor(db, datetime.now(timezone.utc) if explicit_range else end_time)
+        if args.only_keep_traces_with_metrics and db is not None:
+            removed = 0
+            for d in db.collection(args.collection).stream():
+                data = d.to_dict() or {}
+                if _doc_has_populated_metrics(data):
+                    continue
+                if args.dry_run:
+                    print(f"prune-empty-metrics (dry-run): would delete document id={d.id!r}", file=sys.stderr)
+                else:
+                    d.reference.delete()
+                removed += 1
+            print(f"prune-empty-metrics: {'would remove' if args.dry_run else 'removed'} {removed} document(s).", file=sys.stderr)
         print(f"Done. Upserted {total_written} trace document(s) into {args.collection!r}.", file=sys.stderr)
         return
 
@@ -763,6 +1212,8 @@ def main() -> None:
                 doc["ingested_at"] = firestore.SERVER_TIMESTAMP
             _merge_metrics_overrides_into_doc(trace_id, doc, overrides)
             doc = {k: v for k, v in doc.items() if v is not None}
+            if args.only_keep_traces_with_metrics and not _doc_has_populated_metrics(doc):
+                continue
 
             if args.dry_run:
                 print(json.dumps({"trace_id": trace_id, "metrics": doc.get("metrics")}, ensure_ascii=False))
@@ -780,6 +1231,19 @@ def main() -> None:
     should_cursor = db is not None and not args.dry_run and (not explicit_range or args.update_cursor_after_backfill)
     if should_cursor:
         _write_cursor(db, datetime.now(timezone.utc) if explicit_range else end_time)
+
+    if args.only_keep_traces_with_metrics and db is not None:
+        removed = 0
+        for d in db.collection(args.collection).stream():
+            data = d.to_dict() or {}
+            if _doc_has_populated_metrics(data):
+                continue
+            if args.dry_run:
+                print(f"prune-empty-metrics (dry-run): would delete document id={d.id!r}", file=sys.stderr)
+            else:
+                d.reference.delete()
+            removed += 1
+        print(f"prune-empty-metrics: {'would remove' if args.dry_run else 'removed'} {removed} document(s).", file=sys.stderr)
 
     print(f"Done. Upserted {total_written} trace document(s) into {args.collection!r}.", file=sys.stderr)
 

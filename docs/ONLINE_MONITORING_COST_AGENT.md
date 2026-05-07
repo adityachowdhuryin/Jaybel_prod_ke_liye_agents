@@ -366,6 +366,22 @@ Optional: `--trace-ids 'id1,id2'` (or `--trace-ids-file PATH` with one hex id pe
 
 **Firestore only for “evaluated” traces (match the Console Traces sidebar filter):**
 
+0. **`--explorer-reconcile-and-prune` (mirror Trace list + prune)** — Requires **both** `--start-time` and `--end-time` (not incremental cursor mode). Paginates Cloud Trace **`list`** with the same server-side filter as Trace Explorer when you use `--online-evaluator` (default `+online_evaluator:"…"`), **upserts** every trace returned for that window, then **deletes** Firestore documents in `--collection` whose document id is **not** in that set—so Firestore ends up aligned with whatever the **`list`** API returns for that filter slice (typically the same rows as Agent Platform → Traces for that monitor, modulo API/UI lag). Pagination is capped by `--explorer-reconcile-max-pages` or env **`ONLINE_EVAL_EXPLORER_RECONCILE_MAX_PAGES`** (default **500**); if truncation is suspected, raise the cap. If the filtered list returns **zero** traces, the script exits before pruning (avoids wiping the collection).
+
+   Example (adjust UTC bounds to match your “Last 1 week” in the console):
+
+   ```bash
+   bash scripts/sync-online-monitor-to-firestore.sh \
+     --explorer-reconcile-and-prune \
+     --online-evaluator "${ONLINE_EVALUATOR_RESOURCE}" \
+     --start-time '2026-04-29T00:00:00Z' \
+     --end-time '2026-05-06T23:59:59Z'
+   ```
+
+   Cursor: with an explicit window, Firestore incremental cursor advances only when you add **`--update-cursor-after-backfill`** (same idea as trace-id backfills).
+
+   **API vs Console:** In some projects the Cloud Trace **list** API returns **no rows** for the default `+online_evaluator:"…"` filter even though **Agent Platform → Traces** shows rows under the Online monitors pill—and the evaluator resource string may **not appear** anywhere in exported `GET trace` JSON. In that situation you cannot mirror the sidebar filter exactly from Trace alone; use **`--evaluated-trace-allowlist-file`** (paste trace IDs from Console) or a **narrower `--trace-filter`** that the list API accepts, for example **`+span:"invoke_agent cost_metrics_agent"`** (matches ADK spans for the cost agent; still wider than the monitor pill if sampling is selective).
+
 1. **List crawl with an ID allowlist** — Paste the trace IDs from Agent Platform (online monitor filter on), one per line, into a file and run with  
    `--evaluated-trace-allowlist-file PATH`. Only those IDs are upserted from the Cloud Trace `list` results in the time window.
 2. **Drop gen_ai-only noise** — With `--scan-without-list-filter` + `--scan-gen-ai-agent-name`, the default is to **skip** traces that have no online-evaluator span label and no rubric labels (unless they appear in `--metrics-overrides`). Use `--include-non-evaluated-agent-traces` only if you want the old broader behavior.
