@@ -5,14 +5,9 @@ logs/*.err.log
 vertex_agents/cost_metrics_agent_tmp*/
 vertex_agents/pa_orchestrator_agent_tmp*/
 .venv/
-config/gcp.env
 config/*.local.json
 config/*.allowlist
 config/online-eval-metrics-overrides.*.json
-vertex_agents/**/.env
-# Local Next.js env (use frontend/.env.example); may contain credential paths
-frontend/.env
-
 # Local scratch scripts (do not commit)
 tmp_*.py
 
