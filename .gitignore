@@ -1,5 +1,9 @@
 logs/*.log
 logs/*.err.log
+.DS_Store
+# ADK deploy staging copies (not source of truth)
+vertex_agents/cost_metrics_agent_tmp*/
+vertex_agents/pa_orchestrator_agent_tmp*/
 .venv/
 config/gcp.env
 config/*.local.json

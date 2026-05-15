@@ -13,6 +13,7 @@ import json
 import os
 import re
 import warnings
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
@@ -20,6 +21,7 @@ from google.cloud import bigquery
 from pydantic import BaseModel, ConfigDict, Field
 
 from .billing_schema import is_clean_view_mode, llm_schema_description
+from .workflow_view_schema import llm_workflow_view_schema_description
 
 try:
     import vertexai
@@ -40,6 +42,63 @@ except Exception:  # pragma: no cover
 
 MAX_BYTES_DEFAULT = 1_000_000_000
 MAX_RESULT_ROWS = 512
+
+
+@dataclass(frozen=True)
+class BqSqlTarget:
+    """Single-table LLM SQL generation profile (billing view or workflow runtime view)."""
+
+    table_ref: str
+    date_column: str
+    schema_text: str
+    role_line: str
+    amount_line: str
+    schema_mode_note: str
+    schema_appendix: str = ""
+
+
+def gcp_billing_sql_target(table_ref: str) -> BqSqlTarget:
+    schema = llm_schema_description().format(table_ref=table_ref)
+    note = (
+        "You are querying the clean billing view. Use clean columns (e.g. service_name, project_id, region, project_labels) "
+        "and do NOT use nested raw-export fields like service.description or project.id."
+        if is_clean_view_mode()
+        else "You are querying the raw export table with nested fields (e.g. service.description, project.id, location.region)."
+    )
+    return BqSqlTarget(
+        table_ref=table_ref,
+        date_column="usage_start_time",
+        schema_text=schema,
+        role_line="You are a BigQuery analyst for GCP billing exports.",
+        amount_line=(
+            "6. Amounts: SUM(cost); alias totals as total_inr or similar. Mention INR in column names where helpful."
+        ),
+        schema_mode_note=note,
+        schema_appendix="",
+    )
+
+
+def workflow_view_sql_target(table_ref: str) -> BqSqlTarget:
+    schema = llm_workflow_view_schema_description(table_ref)
+    return BqSqlTarget(
+        table_ref=table_ref,
+        date_column="timestamp",
+        schema_text=schema,
+        role_line="You are a BigQuery analyst for agent workflow/runtime usage (USD on cost_usd, tokens, trace_id).",
+        amount_line=(
+            "6. Amounts: SUM(IFNULL(cost_usd, 0)); alias totals as total_usd or similar. All monetary amounts are USD."
+        ),
+        schema_mode_note=(
+            "You are querying the curated workflow/runtime view, not GCP invoice billing. "
+            "Use top-level columns only (timestamp, trace_id, cost_usd, input_tokens, output_tokens)."
+        ),
+        schema_appendix="",
+    )
+
+
+def agent_cost_events_sql_target(table_ref: str) -> BqSqlTarget:
+    """Deprecated alias for workflow_view_sql_target (legacy name)."""
+    return workflow_view_sql_target(table_ref)
 
 
 class BillingSqlGeneration(BaseModel):
@@ -105,33 +164,29 @@ def _is_vertex_permission_error(exc: BaseException) -> bool:
 
 
 def _build_sql_prompt(
-    table_ref: str,
+    target: BqSqlTarget,
     window_start: date,
     window_end: date,
     window_note: str,
     question: str,
 ) -> str:
     ws, we = window_start.isoformat(), window_end.isoformat()
-    schema = llm_schema_description().format(table_ref=table_ref)
-    schema_mode_note = (
-        "You are querying the clean billing view. Use clean columns (e.g. service_name, project_id, region, project_labels) "
-        "and do NOT use nested raw-export fields like service.description or project.id."
-        if is_clean_view_mode()
-        else "You are querying the raw export table with nested fields (e.g. service.description, project.id, location.region)."
-    )
-    return f"""You are a BigQuery analyst for GCP billing exports.
+    dc = target.date_column
+    appendix = (target.schema_appendix or "").strip()
+    appendix_block = f"\nAdditional live schema (truncated):\n{appendix}\n" if appendix else ""
+    return f"""{target.role_line}
 
-{schema}
-{schema_mode_note}
-
+{target.schema_text}
+{target.schema_mode_note}
+{appendix_block}
 Hard requirements:
 1. A single statement only: WITH ... SELECT ... or plain SELECT. No DDL/DML, no multi-statement.
-2. FROM / JOIN must only reference `{table_ref}` (UNNEST of its columns is allowed).
+2. FROM / JOIN must only reference `{target.table_ref}` (UNNEST of its columns is allowed).
 3. WHERE must include exactly this predicate (you may AND more conditions after it):
-   DATE(usage_start_time) BETWEEN DATE('{ws}') AND DATE('{we}')
+   DATE({dc}) BETWEEN DATE('{ws}') AND DATE('{we}')
 4. Use explicit DATE('YYYY-MM-DD') literals for those bounds (do not use parameters).
 5. Prefer aggregates; for wide scans add LIMIT {MAX_RESULT_ROWS} or less.
-6. Amounts: SUM(cost); alias totals as total_inr or similar. Mention INR in column names where helpful.
+{target.amount_line}
 7. Output: you MUST fill the response JSON fields exactly per the API schema: put the full SQL in the `sql` string only (no markdown, no ``` fences). Optional short `rationale` for operators only.
 
 If the user refers to "the same question as above" or "as before", infer the same analytical intent (e.g. top SKUs, breakdown by region) from the conversation and apply any new filters (project id, dates) they specify.
@@ -203,12 +258,12 @@ def _invoke_google_ai(prompt: str) -> BillingSqlGeneration:
 
 def _generate_billing_sql_generation(
     question: str,
-    table_ref: str,
+    target: BqSqlTarget,
     window_start: date,
     window_end: date,
     window_note: str,
 ) -> BillingSqlGeneration:
-    prompt = _build_sql_prompt(table_ref, window_start, window_end, window_note, question)
+    prompt = _build_sql_prompt(target, window_start, window_end, window_note, question)
     provider = os.environ.get("BILLING_LLM_PROVIDER", "auto").strip().lower()
     key = google_ai_api_key()
 
@@ -266,7 +321,7 @@ def _normalize_table_reference(sql: str, table_ref: str) -> str:
     return sql
 
 
-def _validate_llm_sql(sql_raw: str, table_ref: str, window_start: date, window_end: date) -> str:
+def _validate_llm_sql(sql_raw: str, target: BqSqlTarget, window_start: date, window_end: date) -> str:
     sql = _first_statement(sql_raw)
     if not sql:
         raise ValueError("Model returned empty SQL.")
@@ -276,15 +331,22 @@ def _validate_llm_sql(sql_raw: str, table_ref: str, window_start: date, window_e
     if not re.match(r"^\s*(WITH\b[\s\S]*?\bSELECT\b|SELECT\b)", cleaned, re.I):
         raise ValueError("Only SELECT (or WITH ... SELECT) queries are allowed.")
 
+    table_ref = target.table_ref
     sql = _normalize_table_reference(sql, table_ref)
     if f"`{table_ref}`" not in sql:
-        raise ValueError(f"Query must use the billing table exactly as `{table_ref}`.")
+        raise ValueError(f"Query must use the table exactly as `{table_ref}`.")
 
     ws = window_start.isoformat()
     we = window_end.isoformat()
-    if f"DATE('{ws}')" not in sql or f"DATE('{we}')" not in sql:
+    s_low = sql.lower()
+    if f"date('{ws}')" not in s_low or f"date('{we}')" not in s_low:
         raise ValueError(
             f"Query must include the enforced window bounds DATE('{ws}') and DATE('{we}') as literals."
+        )
+    dc = target.date_column
+    if not re.search(rf"date\s*\(\s*`?{re.escape(dc)}`?\s*\)", sql, re.I):
+        raise ValueError(
+            f"Query must filter with DATE({dc}) (or DATE(`{dc}`)) for the enforced window predicate."
         )
     return sql
 
@@ -311,22 +373,22 @@ def _run_query_json(sql: str, project: str, *, max_rows: int = MAX_RESULT_ROWS) 
     return out
 
 
-def run_llm_billing_query(
+def run_llm_cost_sql_query(
     question: str,
-    table_ref: str,
     project: str,
     window_start: date,
     window_end: date,
     window_note: str,
+    target: BqSqlTarget,
 ) -> tuple[str, str]:
     generated = _generate_billing_sql_generation(
         question,
-        table_ref,
+        target,
         window_start,
         window_end,
         window_note,
     )
-    sql = _validate_llm_sql(generated.sql, table_ref, window_start, window_end)
+    sql = _validate_llm_sql(generated.sql, target, window_start, window_end)
     est = _dry_run_bytes(sql, project)
     cap = int(os.environ.get("BILLING_LLM_MAX_BYTES_BILLED", str(MAX_BYTES_DEFAULT)))
     if est > cap:
@@ -335,5 +397,26 @@ def run_llm_billing_query(
         )
     rows = _run_query_json(sql, project)
     body = json.dumps(rows, ensure_ascii=False, indent=2)
-    short = f"llm-sql; window={window_start}..{window_end}; est_bytes={est}; sql_chars={len(sql)}"
+    short = (
+        f"llm-sql; target={target.date_column}; window={window_start}..{window_end}; "
+        f"est_bytes={est}; sql_chars={len(sql)}"
+    )
     return body, short
+
+
+def run_llm_billing_query(
+    question: str,
+    table_ref: str,
+    project: str,
+    window_start: date,
+    window_end: date,
+    window_note: str,
+) -> tuple[str, str]:
+    return run_llm_cost_sql_query(
+        question,
+        project,
+        window_start,
+        window_end,
+        window_note,
+        gcp_billing_sql_target(table_ref),
+    )

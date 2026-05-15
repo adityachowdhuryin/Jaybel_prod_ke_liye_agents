@@ -35,12 +35,13 @@ def llm_schema_description() -> str:
         return """
 Allowed table (only source): `{table_ref}`
 
-Clean billing view columns:
-- usage_start_time TIMESTAMP, usage_end_time TIMESTAMP, invoice_month STRING
-- cost FLOAT64, cost_at_list FLOAT64, currency STRING, cost_type STRING
+Clean billing view columns (jaybel_prod_billing_view style):
+- billing_account_id STRING
 - service_name STRING, sku_description STRING
+- usage_start_time TIMESTAMP, usage_end_time TIMESTAMP, invoice_month STRING
 - project_id STRING, project_name STRING
 - region STRING, country STRING
+- cost FLOAT64, cost_at_list FLOAT64, currency STRING, cost_type STRING
 - usage_amount FLOAT64, usage_unit STRING
 - usage_amount_in_pricing_units FLOAT64, pricing_unit STRING
 - credits ARRAY<STRUCT<...>>

@@ -180,9 +180,15 @@ export function CostResultView({
     return parseCostAssistantMessage(content);
   }, [content, deferStructured]);
 
-  if (deferStructured || !parsed || parsed.kind === "plain") {
+  if (deferStructured || !parsed) {
     return (
       <p className="whitespace-pre-wrap break-words text-sm">{content}</p>
+    );
+  }
+
+  if (parsed.kind === "plain") {
+    return (
+      <p className="whitespace-pre-wrap break-words text-sm">{parsed.text}</p>
     );
   }
 

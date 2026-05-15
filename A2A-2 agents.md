@@ -18,7 +18,7 @@ The retired local specialist execution path (`agents/cost_agent`) has been remov
 - Local backend bridge: `FastAPI` (`agents/orchestrator`)
 - Session store: `PostgreSQL 18`
 - Cloud execution: `Vertex AI Agent Engine` (`pa_orchestrator_agent`, `cost_metrics_agent`)
-- Data source: `BigQuery` view `gls-training-486405.gcp_billing_data.clean_billing_view`
+- Data source: `BigQuery` view `gls-training-486405.gcp_billing_data.jaybel_prod_billing_view`
 - Streaming: SSE (`/chat/stream`) from bridge to browser
 
 ## 3) Runtime Topology (Local Dev)
@@ -88,12 +88,17 @@ Configured source:
 
 - Project: `gls-training-486405`
 - Dataset: `gcp_billing_data`
-- View: `clean_billing_view`
+- View: `jaybel_prod_billing_view`
 - Mode: `BILLING_BQ_SCHEMA_MODE=clean_view`
+
+Optional second source (workflow / runtime view, e.g. `jaybel_prod_workflow_view`):
+
+- Set `BQ_WORKFLOW_TABLE` and optionally `BQ_WORKFLOW_PROJECT` / `BQ_WORKFLOW_DATASET` (default to billing project/dataset). Legacy `BQ_COST_EVENTS_*` is still read as a fallback table name if `BQ_WORKFLOW_TABLE` is unset.
+- When both sources are configured, the **LLM context router** chooses `gcp_billing` vs `gcp_workflow` (`bq_target`), sets confidence, and may ask a **`data_source` clarification** when the ask is ambiguous. Regex/heuristic overrides and deterministic trace totals are **off by default**; opt in only if you need legacy behavior (see env flags below). Workflow amounts are USD on top-level `cost_usd`; date filter uses `timestamp`; traces use `trace_id`.
 
 ## 7) Guardrails & Clarification Behavior
 
-- Clarification-first for ambiguous requests (time scope, top-N, compare scope).
+- Clarification-first for ambiguous requests (time scope, top-N, compare scope, and **data_source** when both billing and the workflow view are configured and the router is unsure).
 - SQL constraints:
   - single statement
   - SELECT/CTE only
@@ -107,10 +112,11 @@ Configured source:
   - unsupported nested distinct queries -> explicit guidance
 - Typed handoff: when the cost tool must return clarification or error JSON, the agent
   emits a single `COST_PAYLOAD_JSON:`-prefixed block (and the orchestrator passes it
-  through unchanged). The local eval script parses that prefix and applies
+  through unchanged). The Next.js `CostResultView` parses that block after streaming completes and shows the clarification question and options as readable text (not raw JSON). The local eval script parses that prefix and applies
   `must_contain_any` to both the raw text and JSON string fields. Local Postgres
   (`DATABASE_URL` / `COST_DATA_SOURCE` fallback) remains supported but is
   **deprecated** for production; prefer BigQuery.
+- Regression focus: ambiguous asks that could hit **either** BigQuery view should yield `data_source` (or router-chosen `bq_target` with high confidence) rather than silent regex routing; trace-style asks should rely on the router (and optional `usage_correlation_id`) unless `BILLING_LEGACY_REGEX_ROUTING=1`.
 
 ## 8) Key Environment Flags
 
@@ -118,7 +124,7 @@ Configured source:
 - `ORCHESTRATOR_LOCAL_CHAT=0` (or unset)
 - `BQ_BILLING_PROJECT=gls-training-486405`
 - `BQ_BILLING_DATASET=gcp_billing_data`
-- `BQ_BILLING_TABLE=clean_billing_view`
+- `BQ_BILLING_TABLE=jaybel_prod_billing_view`
 - `BILLING_BQ_SCHEMA_MODE=clean_view`
 - `COST_DATA_SOURCE=bigquery`
 - `BILLING_AGENT_LLM_SQL=1`
@@ -128,8 +134,14 @@ Configured source:
 - `BILLING_LLM_MAX_LOOKBACK_DAYS=0` (recommended in this setup)
 - `BILLING_DEFAULT_TILL_NOW_SCOPE=full_history`
 - `BILLING_FULL_HISTORY_START_DATE=2026-01-01`
+- `BILLING_DEFAULT_PROJECT_ID=jaybel-prod` (example) — optional default GCP billing `project.id` when the user says "our project"; included in the router deployment context and applied as a thin guardrail if the model still leaves `billing_project_id` unresolved.
+- `BILLING_SCHEMA_DIGEST=1` — optional: fetch a short live column digest from BigQuery (`get_table`) and pass it to the router and LLM SQL prompts (extra API calls).
+- `BILLING_LEGACY_REGEX_ROUTING=1` — opt in to pre-router/post-router regex heuristics (`_heuristic_bq_target`, trace-table signals, silent trace-window resolution) that can override the router.
+- `BILLING_FORCE_WORKFLOW_ON_TRACE_KEYWORDS=1` — **not implemented by default** (LLM-first). If you add it later, it would be an env-gated post-check only; today routing relies on the router prompt + optional `BILLING_LEGACY_REGEX_ROUTING`.
+- `BILLING_DETERMINISTIC_TRACE_TOTAL=1` — opt in to a deterministic BigQuery sum for scalar trace totals on the workflow view (`trace_id` / `cost_usd`) instead of LLM SQL only.
+- Optional: `BQ_WORKFLOW_TABLE=jaybel_prod_workflow_view` (plus `BQ_WORKFLOW_PROJECT` / `BQ_WORKFLOW_DATASET` if different from billing). Legacy: `BQ_COST_EVENTS_*` still supported as a fallback env name.
+- Local smoke (orchestrator + Agent Engine): `python scripts/smoke-orchestrator-cost-questions.py` (set `ORCHESTRATOR_AUTH_DISABLED=1`, run orchestrator on `127.0.0.1:8000`, optional `ORCHESTRATOR_URL`).
 
-## 9) Operational Status
 
 - Agent Engine-only execution: implemented
 - Local specialist execution path: removed

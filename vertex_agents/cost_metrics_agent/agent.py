@@ -72,6 +72,22 @@ def _extract_time_window(text: str) -> str | None:
     return None
 
 
+def _infer_bq_target_from_clarification_reply(q_lower: str) -> str | None:
+    if "gcp billing" in q_lower or "billing export" in q_lower:
+        return "gcp_billing"
+    if (
+        "workflow" in q_lower
+        or "runtime view" in q_lower
+        or "tokens & traces" in q_lower
+        or "agent usage" in q_lower
+        or "cost_events" in q_lower.replace(" ", "")
+        or "usage log" in q_lower
+        or ("runtime" in q_lower and "token" in q_lower)
+    ):
+        return "gcp_workflow"
+    return None
+
+
 def _default_missing_for_kind(kind: str) -> list[str]:
     if kind == "top_n":
         return ["top_n"]
@@ -83,6 +99,10 @@ def _default_missing_for_kind(kind: str) -> list[str]:
         return ["service_a", "service_b"]
     if kind == "schema_column":
         return ["column_name"]
+    if kind == "data_source":
+        return ["data_source"]
+    if kind == "billing_project_id":
+        return ["billing_project_id"]
     return []
 
 
@@ -124,6 +144,19 @@ def _resume_pending_clarification(question: str, pending: dict[str, Any]) -> tup
     missing = list(updated.get("missing_slots") or _default_missing_for_kind(str(updated.get("clarification_kind") or "")))
     q = _normalize_spaces(question)
     q_lower = q.lower()
+    kind = str(updated.get("clarification_kind") or "")
+
+    if "data_source" in missing or kind == "data_source":
+        choice = _infer_bq_target_from_clarification_reply(q_lower)
+        if choice:
+            context["bq_target_user_choice"] = choice
+            missing = [m for m in missing if m != "data_source"]
+
+    if "billing_project_id" in missing or kind == "billing_project_id":
+        cand = q.strip()
+        if cand and len(cand) <= 128 and all(ch.isalnum() or ch in ".-_" for ch in cand):
+            context["billing_project_id_resume"] = cand
+            missing = [m for m in missing if m != "billing_project_id"]
 
     if "compare_scope" in missing:
         scope = _detect_compare_scope(q)
@@ -177,9 +210,36 @@ def _resume_pending_clarification(question: str, pending: dict[str, Any]) -> tup
             updated["clarification_kind"] = "compare_time_window"
             updated["question"] = "For what time window should I compare spend?"
             updated["options"] = ["Last 7 days", "Last 30 days", "This month (month-to-date)", "Full history to date"]
+        elif "data_source" in missing:
+            updated["clarification_kind"] = "data_source"
+            updated["question"] = (
+                "Should this query use the GCP billing export (INR) or the workflow / runtime view (USD, tokens)?"
+            )
+            updated["options"] = ["GCP billing export", "Workflow / runtime view (tokens & traces)"]
+        elif "billing_project_id" in missing:
+            updated["clarification_kind"] = "billing_project_id"
+            updated["question"] = "Which GCP project id should I use (billing export project.id)?"
+            updated["options"] = []
         return None, updated
     if str(updated.get("clarification_kind") or "").startswith("compare"):
         return _build_compare_question(updated), None
+    prefixes: list[str] = []
+    if context.get("bq_target_user_choice"):
+        prefixes.append(
+            f"{db_logic.DATA_SOURCE_CHOICE_PREFIX}{context['bq_target_user_choice']}"
+        )
+    if context.get("billing_project_id_resume"):
+        prefixes.append(
+            f"{db_logic.BILLING_PROJECT_CHOICE_PREFIX}{context['billing_project_id_resume']}"
+        )
+    if prefixes:
+        orig = str(updated.get("original_question") or "").strip()
+        base = orig if orig else q
+        pfx = "\n".join(prefixes) + "\n"
+        extra = q.strip() if q and (not orig or q.lower() not in orig.lower()) else ""
+        if extra and extra.lower() != orig.lower().strip():
+            return f"{pfx}{base}\n{extra}", None
+        return f"{pfx}{base}", None
     return q, None
 
 
@@ -284,11 +344,12 @@ root_agent = LlmAgent(
         "You are a cloud cost analyst. For cost answers, use query_cloud_costs as the source of truth. "
         "MANDATORY: call query_cloud_costs for every user turn that mentions or implies spend, cost, compare, services, time periods, or rankings (including one-word or vague asks such as 'Compare spend.' with no time window or entities). "
         "Do not answer from prior knowledge, templates, or generic cost advice before the tool has run. "
-        "You may also answer schema questions about the configured billing BigQuery source, such as listing columns, checking whether a column exists, or listing distinct values for a valid column. "
+        "You may also answer schema questions about the configured BigQuery sources (GCP billing view and optional workflow/runtime view), such as listing columns, checking whether a column exists, or listing distinct values for a valid column. "
         "Never invent values, services, currencies, date windows, rankings, or trends. "
         "Never confuse normalized output fields with the actual BigQuery view schema. "
         "STRICT: If the tool return starts with 'COST_PAYLOAD_JSON:' (clarification or error from query_cloud_costs), your entire final assistant message must be exactly that tool string — same characters, no paraphrase, no preamble, no extra lines. "
-        "For any other tool result (numeric/table JSON without that prefix), summarize faithfully and mention the effective window/filters. "
+        "For any other tool result (numeric/table JSON without that prefix), summarize faithfully in natural language: mention the effective window and filters; round currency sensibly; state INR vs USD when relevant; use markdown bullets or a compact table for breakdowns. Do not paste raw JSON. Do not echo internal slot names (billing_project_id, top_n, data_source). "
+        "If the user clearly wants both GCP invoice totals and workflow/runtime usage in one turn and the first tool result is not enough, call query_cloud_costs again with an explicit follow-up question scoped to the other source (after any required clarification). "
         "If the request is ambiguous (missing time window, scope, grouping, compare entities, or top-N), ask one concise clarification after the tool provides it — but when the tool returns COST_PAYLOAD_JSON for clarification, output only that block. "
         "Never expose internal chain-of-thought or fabricate fallback results."
     ),

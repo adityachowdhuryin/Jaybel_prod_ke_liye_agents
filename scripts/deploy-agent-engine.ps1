@@ -35,14 +35,21 @@ param(
     [string]$DatabaseUrl = '',
     [string]$CostDataSource = 'bigquery',
     [string]$BillingSchemaMode = 'clean_view',
-    [string]$BillingTable = 'clean_billing_view',
+    [string]$BillingTable = 'jaybel_prod_billing_view',
     [string]$BillingDataset = 'gcp_billing_data',
     [string]$BillingProject = '',
     [string]$BillingDefaultTillNowScope = 'full_history',
     [string]$BillingFullHistoryStartDate = '2026-01-01',
+    [string]$WorkflowTable = 'jaybel_prod_workflow_view',
+    [string]$WorkflowDataset = '',
+    [string]$WorkflowProject = '',
+    [string]$CostEventsTable = '',
+    [string]$CostEventsDataset = '',
+    [string]$CostEventsProject = '',
+    [string]$BillingDefaultProjectId = '',
     [string]$AgentEngineId = '',
-    [string]$CostAgentEngineId = '5616525846761177088',
-    [string]$OrchestratorAgentEngineId = '8296018091465244672',
+    [string]$CostAgentEngineId = '3600096288210681856',
+    [string]$OrchestratorAgentEngineId = '7920943888905273344',
     [switch]$ForceNewEngine
 )
 
@@ -92,12 +99,42 @@ try {
             "BILLING_BQ_SCHEMA_MODE=$BillingSchemaMode"
             "BILLING_DEFAULT_TILL_NOW_SCOPE=$BillingDefaultTillNowScope"
             "BILLING_FULL_HISTORY_START_DATE=$BillingFullHistoryStartDate"
+            "BILLING_AGENT_LLM_SQL=1"
+            "BILLING_CONTEXT_ROUTER_ENABLED=1"
+            "BILLING_LLM_PROVIDER=auto"
+            "BILLING_LLM_MAX_BYTES_BILLED=1000000000"
+            "BILLING_LLM_MAX_LOOKBACK_DAYS=0"
             "OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental"
             "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=EVENT_ONLY"
         )
         if ($db) {
             $lines += "DATABASE_URL=$db"
         }
+        if ($WorkflowTable) {
+            $wp = $WorkflowProject
+            if (-not $wp) { $wp = $billingProjectResolved }
+            $wd = $WorkflowDataset
+            if (-not $wd) { $wd = $BillingDataset }
+            $lines += "BQ_WORKFLOW_PROJECT=$wp"
+            $lines += "BQ_WORKFLOW_DATASET=$wd"
+            $lines += "BQ_WORKFLOW_TABLE=$WorkflowTable"
+        }
+        if ($CostEventsTable) {
+            $cep = $CostEventsProject
+            if (-not $cep) { $cep = $billingProjectResolved }
+            $ced = $CostEventsDataset
+            if (-not $ced) { $ced = $BillingDataset }
+            $lines += "BQ_COST_EVENTS_PROJECT=$cep"
+            $lines += "BQ_COST_EVENTS_DATASET=$ced"
+            $lines += "BQ_COST_EVENTS_TABLE=$CostEventsTable"
+        }
+        if ($BillingDefaultProjectId) {
+            $lines += "BILLING_DEFAULT_PROJECT_ID=$BillingDefaultProjectId"
+        }
+        $lines += ''
+        $lines += '# Optional: BILLING_SCHEMA_DIGEST=1 — live BigQuery column digest for router + SQL.'
+        $lines += '# Optional legacy: BILLING_LEGACY_REGEX_ROUTING=1 — regex bq_target overrides + silent trace window shortcut.'
+        $lines += '# Optional: BILLING_DETERMINISTIC_TRACE_TOTAL=1 — deterministic SUM for scalar trace totals on workflow view.'
         Set-Content -Path $CostEnv -Value $lines
         Write-Host ('Wrote {0} (COST_DATA_SOURCE={1}, BQ table={2}.{3}.{4})' -f $CostEnv, $CostDataSource, $billingProjectResolved, $BillingDataset, $BillingTable)
     }

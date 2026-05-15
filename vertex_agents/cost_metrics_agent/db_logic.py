@@ -12,7 +12,7 @@ import calendar
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
@@ -20,13 +20,22 @@ from typing import Any
 from google.cloud import bigquery
 import psycopg
 
-from .billing_context_router import ResolvedCostContext, llm_context_router_usable, resolve_cost_context
+from .billing_context_router import (
+    ResolvedCostContext,
+    llm_context_router_usable,
+    normalize_bq_target,
+    resolve_cost_context,
+)
 from .billing_llm_sql import (
     google_ai_configured,
+    gcp_billing_sql_target,
     llm_sql_usable,
-    run_llm_billing_query,
+    run_llm_cost_sql_query,
     vertex_available,
+    workflow_view_sql_target,
 )
+from .bq_schema_digest import build_dual_table_schema_digest
+from .workflow_bq_env import workflow_raw_table_name, workflow_table_configured, workflow_table_fqn
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -40,6 +49,49 @@ BQ_BILLING_PROJECT = os.environ.get("BQ_BILLING_PROJECT", "").strip()
 BQ_BILLING_DATASET = os.environ.get("BQ_BILLING_DATASET", "").strip()
 BQ_BILLING_TABLE = os.environ.get("BQ_BILLING_TABLE", "").strip()
 _SCHEMA_VALUE_LIMIT = 100
+
+DATA_SOURCE_CHOICE_PREFIX = "_DATA_SOURCE_CHOICE_:"
+BILLING_PROJECT_CHOICE_PREFIX = "_BILLING_PROJECT_ID_:"
+
+
+def _billing_legacy_regex_routing() -> bool:
+    return os.environ.get("BILLING_LEGACY_REGEX_ROUTING", "").lower() in ("1", "true", "yes")
+
+
+def _billing_deterministic_trace_total() -> bool:
+    return os.environ.get("BILLING_DETERMINISTIC_TRACE_TOTAL", "").lower() in ("1", "true", "yes")
+
+
+def _strip_forced_data_source_prefix(question: str) -> tuple[str, str | None]:
+    forced: str | None = None
+    out_lines: list[str] = []
+    for line in question.splitlines():
+        s = line.strip()
+        low = s.lower()
+        pfx = DATA_SOURCE_CHOICE_PREFIX.lower()
+        if low.startswith(pfx):
+            val = s[len(DATA_SOURCE_CHOICE_PREFIX) :].strip().lower()
+            if val in ("gcp_billing", "gcp_workflow", "agent_cost_events"):
+                forced = normalize_bq_target(val)
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines).strip(), forced
+
+
+def _strip_forced_billing_project_prefix(question: str) -> tuple[str, str | None]:
+    forced: str | None = None
+    out_lines: list[str] = []
+    pfx_len = len(BILLING_PROJECT_CHOICE_PREFIX)
+    for line in question.splitlines():
+        s = line.strip()
+        low = s.lower()
+        if low.startswith(BILLING_PROJECT_CHOICE_PREFIX.lower()):
+            val = s[pfx_len:].strip()
+            if val:
+                forced = val
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines).strip(), forced
 
 
 def get_connection():
@@ -137,6 +189,208 @@ def _dev_mention_is_project_slug(q: str) -> bool:
 
 def _normalize_project_id_slug(raw: str) -> str:
     return re.sub(r"\s+", "", raw.strip().lower())
+
+
+def _workflow_configured() -> bool:
+    bp = (BQ_BILLING_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT", "")).strip()
+    ds = (BQ_BILLING_DATASET or "").strip()
+    return workflow_table_configured(billing_project=bp, billing_dataset=ds)
+
+
+def _workflow_table_ref() -> tuple[str, str]:
+    bp = (BQ_BILLING_PROJECT or os.environ.get("GOOGLE_CLOUD_PROJECT", "")).strip()
+    ds = (BQ_BILLING_DATASET or "").strip()
+    fqn = workflow_table_fqn(billing_project=bp, billing_dataset=ds)
+    if not fqn:
+        raise RuntimeError(
+            "Set BQ_WORKFLOW_TABLE (optional BQ_WORKFLOW_PROJECT / BQ_WORKFLOW_DATASET; "
+            "or legacy BQ_COST_EVENTS_*; defaults to BQ_BILLING_*)."
+        )
+    proj = fqn.split(".", 2)[0]
+    return proj, fqn
+
+
+def _heuristic_bq_target(question: str) -> str:
+    q = question.lower()
+    if _question_signals_usage_trace_table(question):
+        return "gcp_workflow"
+    triggers = (
+        "cost_events",
+        "cost events",
+        "token usage",
+        "input tokens",
+        "output tokens",
+        "inference cost",
+        "llm cost",
+        "model cost",
+        "gemini cost",
+        "agent cost",
+        "agent engine cost",
+        "adk ",
+        "trace_id",
+        "mcp tools",
+        "jsonpayload",
+        "engine_id",
+        "engine display",
+    )
+    if any(t in q for t in triggers):
+        return "gcp_workflow"
+    return "gcp_billing"
+
+
+def _question_signals_usage_trace_table(question: str) -> bool:
+    """Identifiers from workflow/runtime traces, not GCP billing SKUs."""
+    if not question or not question.strip():
+        return False
+    ql = question.lower()
+    if "demo-trace" in ql:
+        return True
+    if re.search(r"\bemail-\d+", ql):
+        return True
+    if re.search(r"\bdemo-trace-[a-z0-9_-]+\b", question, re.I):
+        return True
+    if re.search(r"\btrace-[a-z0-9_.]+\b", ql) and "project" not in ql:
+        return True
+    return False
+
+
+def _extract_usage_correlation_id(question: str) -> str | None:
+    """Match trace_id values (e.g. demo-trace-2, email-177…)."""
+    for pattern in (
+        r"(?i)\b(demo-trace-[a-z0-9_-]+)\b",
+        r"\b(email-\d{6,})\b",
+        r"(?i)\b(trace-[a-z0-9_-]{3,80})\b",
+    ):
+        m = re.search(pattern, question)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _asks_scalar_total(question: str) -> bool:
+    q = question.lower()
+    return bool(
+        re.search(r"\b(total|sum|combined|aggregate)\b", q)
+        or (
+            re.search(r"\b(how\s+much|cost|spend|spent|price)\b", q)
+            and not re.search(r"\b(breakdown|by\s+service|per\s+sku)\b", q)
+        )
+    )
+
+
+def _trace_cost_default_window(question: str, today: date) -> tuple[date, date]:
+    ql = " ".join(question.lower().split())
+    if "this month" in ql or "month-to-date" in ql or "month to date" in ql:
+        return date(today.year, today.month, 1), today
+    if "last month" in ql:
+        first_this = date(today.year, today.month, 1)
+        last_prev = first_this - timedelta(days=1)
+        start = date(last_prev.year, last_prev.month, 1)
+        end = date(last_prev.year, last_prev.month, calendar.monthrange(last_prev.year, last_prev.month)[1])
+        return start, end
+    if re.search(r"\blast\s+(\d+)\s+days?\b", ql):
+        n = int(re.search(r"\blast\s+(\d+)\s+days?\b", ql).group(1))
+        end = today
+        start = today - timedelta(days=min(max(n, 1), 366) - 1)
+        return start, end
+    start = _full_history_start(today)
+    return start, today
+
+
+def _maybe_resolve_trace_query_without_clarification(
+    question: str,
+    routed: ResolvedCostContext,
+    today: date,
+) -> ResolvedCostContext:
+    """Avoid router time-window clarification for demo-trace / email-* usage lookups."""
+    if not _question_signals_usage_trace_table(question):
+        return routed
+    if not routed.needs_clarification:
+        return routed
+    ms = [str(x).strip() for x in (routed.missing_slots or []) if str(x).strip()]
+    if ms != ["time_window"]:
+        return routed
+    ws, we = _trace_cost_default_window(question, today)
+    hint = routed.hint or "no explicit filters"
+    hint = f"{hint}; defaulted time window for usage/trace lookup ({ws} to {we})"
+    return replace(
+        routed,
+        needs_clarification=False,
+        missing_slots=[],
+        clarification_question=None,
+        clarification_options=[],
+        clarification_kind=None,
+        clarification_priority=None,
+        window_start=ws,
+        window_end=we,
+        hint=hint,
+        bq_target="gcp_workflow",
+    )
+
+
+def _deterministic_trace_total_usd(
+    *,
+    table_ref: str,
+    job_project: str,
+    correlation_id: str,
+    window_start: date,
+    window_end: date,
+) -> float:
+    """Exact SUM(cost_usd) for trace_id on the workflow view (no LLM SQL)."""
+    sql = (
+        f"SELECT COALESCE(SUM(IFNULL(cost_usd, 0)), 0) AS total_usd "
+        f"FROM `{table_ref}` "
+        f"WHERE DATE(timestamp) BETWEEN @ws AND @we "
+        f"AND LOWER(TRIM(CAST(trace_id AS STRING))) = LOWER(@tid)"
+    )
+    client = bigquery.Client(project=job_project)
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("tid", "STRING", correlation_id),
+            bigquery.ScalarQueryParameter("ws", "DATE", window_start),
+            bigquery.ScalarQueryParameter("we", "DATE", window_end),
+        ]
+    )
+    rows = list(client.query(sql, job_config=job_config).result())
+    if not rows:
+        return 0.0
+    val = rows[0].get("total_usd")
+    return float(val or 0)
+
+
+def _schema_question_targets_workflow_view(question: str) -> bool:
+    if not _workflow_configured():
+        return False
+    tname = workflow_raw_table_name().lower()
+    q = question.lower()
+    q_compact = q.replace("-", "_").replace(" ", "_")
+    if tname and tname.replace("-", "_") in q_compact:
+        return True
+    for needle in (
+        "workflow view",
+        "jaybel_prod_workflow",
+        "runtime view",
+        "input_tokens",
+        "output_tokens",
+        "trace_id",
+    ):
+        if needle in q:
+            return True
+    if "cost_events" in q_compact:
+        return True
+    if "cost event" in q or "usage log" in q:
+        return True
+    if _billing_legacy_regex_routing():
+        return _heuristic_bq_target(question) == "gcp_workflow"
+    return False
+
+
+def _schema_table_choice(question: str) -> tuple[str, str]:
+    if _schema_question_targets_workflow_view(question):
+        _, ref = _workflow_table_ref()
+        return ref, workflow_raw_table_name()
+    table_project, ref = _bq_table_ref()
+    return ref, BQ_BILLING_TABLE
 
 
 def _schema_mode() -> str:
@@ -447,11 +701,12 @@ def _preflight_window_with_dry_run(
     table_ref: str,
     start: date,
     end: date,
+    date_column: str = "usage_start_time",
 ) -> tuple[bool, int]:
     max_bytes = int(os.environ.get("BILLING_LLM_MAX_BYTES_BILLED", "1000000000"))
     sql = (
         f"SELECT 1 FROM `{table_ref}` "
-        f"WHERE DATE(usage_start_time) BETWEEN DATE('{start.isoformat()}') AND DATE('{end.isoformat()}') "
+        f"WHERE DATE({date_column}) BETWEEN DATE('{start.isoformat()}') AND DATE('{end.isoformat()}') "
         "LIMIT 1"
     )
     client = bigquery.Client(project=job_project)
@@ -487,6 +742,7 @@ def compute_llm_date_window(
     *,
     preflight_job_project: str | None = None,
     preflight_table_ref: str | None = None,
+    date_column_for_preflight: str = "usage_start_time",
     original_question: str = "",
 ) -> tuple[date, date, str]:
     max_days = int(os.environ.get("BILLING_LLM_MAX_LOOKBACK_DAYS", "30"))
@@ -546,6 +802,7 @@ def compute_llm_date_window(
                         table_ref=preflight_table_ref,
                         start=start,
                         end=end,
+                        date_column=date_column_for_preflight,
                     )
                     if ok:
                         notes.append(
@@ -820,10 +1077,15 @@ def _list_schema_fields(fields: list[Any], prefix: str = "") -> list[dict[str, s
     return rows
 
 
+def _bigquery_schema_rows_for_ref(table_ref: str) -> list[dict[str, str]]:
+    client = _bq_client()
+    table = client.get_table(table_ref)
+    return _list_schema_fields(list(table.schema))
+
+
 def _bigquery_schema_rows() -> list[dict[str, str]]:
     _, table_ref = _bq_table_ref()
-    table = _bq_client().get_table(table_ref)
-    return _list_schema_fields(list(table.schema))
+    return _bigquery_schema_rows_for_ref(table_ref)
 
 
 def _normalize_column_token(token: str) -> str:
@@ -912,8 +1174,7 @@ def _is_supported_distinct_type(field_type: str) -> bool:
     }
 
 
-def _query_distinct_column_values(column_name: str, field_type: str) -> str:
-    _, table_ref = _bq_table_ref()
+def _query_distinct_column_values(table_ref: str, column_name: str, field_type: str) -> str:
     sql = f"""
     SELECT DISTINCT `{column_name}` AS value
     FROM `{table_ref}`
@@ -945,7 +1206,11 @@ def _query_bigquery_schema(question: str) -> str | None:
         or _is_distinct_value_query(question)
     ):
         return None
-    schema_rows = _bigquery_schema_rows()
+    try:
+        schema_ref, table_label = _schema_table_choice(question)
+    except RuntimeError:
+        schema_ref, table_label = _bq_table_ref()[1], BQ_BILLING_TABLE
+    schema_rows = _bigquery_schema_rows_for_ref(schema_ref)
     lookup = _schema_field_lookup(schema_rows)
 
     if _is_schema_list_query(question) and not _is_distinct_value_query(question):
@@ -976,7 +1241,7 @@ def _query_bigquery_schema(question: str) -> str | None:
             )
         return _error_payload(
             "unknown_column",
-            f"The column `{column_name}` does not exist in `{BQ_BILLING_TABLE}`; "
+            f"The column `{column_name}` does not exist in `{table_label}`; "
             f"cannot verify existence or list values for unknown columns.",
             "Ask for the full column list to inspect the live BigQuery schema.",
         )
@@ -985,7 +1250,7 @@ def _query_bigquery_schema(question: str) -> str | None:
         if not field:
             return _error_payload(
                 "unknown_column",
-                f"The column `{column_name}` does not exist in `{BQ_BILLING_TABLE}`; "
+                f"The column `{column_name}` does not exist in `{table_label}`; "
                 f"cannot verify existence or list values for unknown columns.",
                 "Ask for the full column list to inspect the live BigQuery schema.",
             )
@@ -995,7 +1260,7 @@ def _query_bigquery_schema(question: str) -> str | None:
                 f"Distinct-value listing is only supported for top-level scalar columns. `{field['column_name']}` is type {field['type']}.",
                 "Try a top-level scalar column such as project_name, project_id, service_name, region, or currency.",
             )
-        return _query_distinct_column_values(field["column_name"], field["type"])
+        return _query_distinct_column_values(schema_ref, field["column_name"], field["type"])
 
     return None
 
@@ -1046,6 +1311,10 @@ def _clarification_from_router_slots(routed: ResolvedCostContext) -> str | None:
             kind = "compare_entities"
         elif priority == "column_name":
             kind = "schema_column"
+        elif priority == "data_source":
+            kind = "data_source"
+        elif priority == "billing_project_id":
+            kind = "billing_project_id"
         else:
             kind = "time_window"
 
@@ -1064,6 +1333,14 @@ def _clarification_from_router_slots(routed: ResolvedCostContext) -> str | None:
             options = ["Cloud SQL vs Vertex AI", "BigQuery vs Cloud Storage", "Cloud Run vs Compute Engine"]
         elif kind == "schema_column":
             question = "Which column should I use?"
+            options = []
+        elif kind == "data_source":
+            question = (
+                "Should this query use the GCP billing export (INR) or the workflow / runtime view (USD, tokens)?"
+            )
+            options = ["GCP billing export", "Workflow / runtime view (tokens & traces)"]
+        elif kind == "billing_project_id":
+            question = "Which GCP project id should I filter on (billing export project.id)?"
             options = []
         else:
             question = "What time window should I use for this cost query?"
@@ -1102,10 +1379,76 @@ def query_cost_data(question: str) -> tuple[str, str]:
                     indent=2,
                 )
                 return err, f"{hint}; source=bigquery; currency=INR"
+            bq_target = "gcp_billing"
+            dual_source = _workflow_configured()
+            work_question, forced_ds = _strip_forced_data_source_prefix(question)
+            work_question, forced_bp = _strip_forced_billing_project_prefix(work_question)
+            schema_digest = ""
+            if os.environ.get("BILLING_SCHEMA_DIGEST", "").lower() in ("1", "true", "yes"):
+                try:
+                    schema_digest = build_dual_table_schema_digest()
+                except Exception:
+                    schema_digest = ""
+
             if os.environ.get("BILLING_CONTEXT_ROUTER_ENABLED", "1").lower() not in ("0", "false", "no"):
                 if llm_context_router_usable():
                     try:
-                        routed = resolve_cost_context(question, today=date.today())
+                        routed = resolve_cost_context(
+                            work_question,
+                            today=date.today(),
+                            schema_digest=schema_digest or "",
+                            dual_source_available=dual_source,
+                        )
+                        if _billing_legacy_regex_routing():
+                            routed = _maybe_resolve_trace_query_without_clarification(
+                                work_question, routed, date.today()
+                            )
+                            if _question_signals_usage_trace_table(work_question):
+                                routed = replace(routed, bq_target="gcp_workflow")
+                        if forced_ds:
+                            ms = [
+                                s
+                                for s in (routed.missing_slots or [])
+                                if str(s).strip().lower() != "data_source"
+                            ]
+                            nc = bool(ms)
+                            upd: dict[str, Any] = {
+                                "bq_target": forced_ds,
+                                "bq_target_confidence": "high",
+                                "missing_slots": ms,
+                                "needs_clarification": nc,
+                            }
+                            if not nc:
+                                upd.update(
+                                    clarification_question=None,
+                                    clarification_options=[],
+                                    clarification_kind=None,
+                                    clarification_priority=None,
+                                )
+                            routed = replace(routed, **upd)
+                        if forced_bp:
+                            rs = dict(routed.resolved_slots or {})
+                            rs["billing_project_id"] = forced_bp
+                            ms_bp = [
+                                s
+                                for s in (routed.missing_slots or [])
+                                if str(s).strip().lower() != "billing_project_id"
+                            ]
+                            nc_bp = bool(ms_bp)
+                            upd_bp: dict[str, Any] = {
+                                "billing_project_id": forced_bp.strip().lower(),
+                                "resolved_slots": rs,
+                                "missing_slots": ms_bp,
+                                "needs_clarification": nc_bp,
+                            }
+                            if not nc_bp:
+                                upd_bp.update(
+                                    clarification_question=None,
+                                    clarification_options=[],
+                                    clarification_kind=None,
+                                    clarification_priority=None,
+                                )
+                            routed = replace(routed, **upd_bp)
                         clarification = _clarification_from_router_slots(routed)
                         if clarification is not None:
                             return (
@@ -1123,38 +1466,120 @@ def query_cost_data(question: str) -> tuple[str, str]:
                             wants_top=routed.wants_top,
                             hint=routed.hint,
                         )
-                        rewritten_question = routed.rewritten_question or question
+                        rewritten_question = routed.rewritten_question or work_question
                         hint = f.hint
                         router_status = "router_ok"
+                        bq_target = normalize_bq_target(routed.bq_target)
                     except Exception as e:
                         router_status = f"router_fallback({type(e).__name__})"
+                        bq_target = (
+                            _heuristic_bq_target(question) if _billing_legacy_regex_routing() else "gcp_billing"
+                        )
+                else:
+                    bq_target = (
+                        _heuristic_bq_target(question) if _billing_legacy_regex_routing() else "gcp_billing"
+                    )
+            else:
+                bq_target = _heuristic_bq_target(question) if _billing_legacy_regex_routing() else "gcp_billing"
+
+            if _billing_legacy_regex_routing() and _question_signals_usage_trace_table(question):
+                bq_target = "gcp_workflow"
+
+            bq_target = normalize_bq_target(bq_target)
+
+            if bq_target == "gcp_workflow":
+                if not _workflow_configured():
+                    err = json.dumps(
+                        {
+                            "error": "workflow_view_not_configured",
+                            "detail": (
+                                "Set BQ_WORKFLOW_TABLE (optional BQ_WORKFLOW_PROJECT / BQ_WORKFLOW_DATASET; "
+                                "or legacy BQ_COST_EVENTS_*; defaults to BQ_BILLING_*)."
+                            ),
+                        },
+                        indent=2,
+                    )
+                    return err, f"{hint}; source=bigquery; bq_target=gcp_workflow"
+                _, active_ref = _workflow_table_ref()
+                date_col = "timestamp"
+                currency_hint = "USD"
+            else:
+                active_ref = table_ref
+                date_col = "usage_start_time"
+                currency_hint = "INR"
+
             ws, we, wnote = compute_llm_date_window(
                 f,
                 date.today(),
                 preflight_job_project=table_project,
-                preflight_table_ref=table_ref,
-                original_question=question,
+                preflight_table_ref=active_ref,
+                date_column_for_preflight=date_col,
+                original_question=work_question,
             )
             extra = hint if hint and hint != "no explicit filters" else ""
             if router_status != "router_ok":
                 extra = f"{extra}; {router_status}".strip("; ").strip()
             wnote_full = f"{wnote} Context hints: {extra}".strip() if extra else wnote
+            cid = (
+                _extract_usage_correlation_id(work_question)
+                or _extract_usage_correlation_id(question)
+                or _extract_usage_correlation_id(rewritten_question)
+            )
+            if (
+                _billing_deterministic_trace_total()
+                and bq_target == "gcp_workflow"
+                and _workflow_configured()
+                and cid
+                and (_asks_scalar_total(work_question) or _asks_scalar_total(question))
+            ):
+                try:
+                    total = _deterministic_trace_total_usd(
+                        table_ref=active_ref,
+                        job_project=table_project,
+                        correlation_id=cid,
+                        window_start=ws,
+                        window_end=we,
+                    )
+                    row = {
+                        "trace_id": cid,
+                        "total_usd": round(total, 6),
+                        "currency": "USD",
+                        "window_start": ws.isoformat(),
+                        "window_end": we.isoformat(),
+                    }
+                    body = json.dumps([row], ensure_ascii=False, indent=2)
+                    sh = (
+                        f"deterministic-usage-total; trace_id={cid}; window={ws}..{we}; "
+                        f"bq_target=gcp_workflow"
+                    )
+                    return body, f"{hint}; {sh}; source=bigquery; bq_target={bq_target}; currency=USD"
+                except Exception:
+                    pass
             try:
-                body, sh = run_llm_billing_query(
+                base_target = (
+                    workflow_view_sql_target(active_ref)
+                    if bq_target == "gcp_workflow"
+                    else gcp_billing_sql_target(table_ref)
+                )
+                appendix = schema_digest.strip() if schema_digest else ""
+                target = (
+                    replace(base_target, schema_appendix=appendix) if appendix else base_target
+                )
+                body, sh = run_llm_cost_sql_query(
                     rewritten_question,
-                    table_ref,
                     table_project,
                     ws,
                     we,
                     wnote_full,
+                    target,
                 )
-                return body, f"{hint}; {sh}; source=bigquery; currency=INR"
+                return body, f"{hint}; {sh}; source=bigquery; bq_target={bq_target}; currency={currency_hint}"
             except Exception as e:
                 err = json.dumps(
                     {"error": "llm_sql_failed", "detail": str(e)},
                     indent=2,
                 )
-                return err, f"{hint}; llm-sql failed; source=bigquery; currency=INR"
+                return err, f"{hint}; llm-sql failed; source=bigquery; currency={currency_hint}"
         try:
             return (
                 _query_bigquery(question),
@@ -1180,7 +1605,7 @@ def query_costs(question: str) -> str:
             return _error_payload(
                 "bigquery_schema_failed",
                 str(e),
-                "Check BQ_BILLING_* and IAM; table/view metadata must be readable.",
+                "Check BQ_BILLING_* / optional BQ_WORKFLOW_* (or legacy BQ_COST_EVENTS_*) and IAM; table metadata must be readable.",
             )
 
     try:

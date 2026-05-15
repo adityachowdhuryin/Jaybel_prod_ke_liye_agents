@@ -55,6 +55,22 @@ class BillingRoutePayload(BaseModel):
         default=None,
         description="explicit_window|month_to_date|full_history_to_date|unsure",
     )
+    bq_target: str | None = Field(
+        default=None,
+        description="gcp_billing|gcp_workflow — which BigQuery view to query (legacy: agent_cost_events)",
+    )
+    bq_target_confidence: str | None = Field(
+        default="high",
+        description="high|medium|low — your confidence in bq_target",
+    )
+    usage_correlation_id: str | None = Field(
+        default=None,
+        description="For workflow view: exact trace_id string when the user gave one; null if N/A",
+    )
+    needs_data_source_clarification: bool = Field(
+        default=False,
+        description="True if invoice billing vs usage logs is ambiguous; ask user before querying",
+    )
 
 
 @dataclass(frozen=True)
@@ -78,6 +94,34 @@ class ResolvedCostContext:
     required_slots: list[str]
     resolved_slots: dict[str, Any]
     clarification_priority: str | None
+    bq_target: str
+    bq_target_confidence: str
+    usage_correlation_id: str | None
+
+
+def normalize_bq_target_confidence(raw: str | None) -> str:
+    t = (raw or "high").strip().lower()
+    if t in ("high", "medium", "low"):
+        return t
+    return "high"
+
+
+def normalize_bq_target(raw: str | None) -> str:
+    t = (raw or "").strip().lower()
+    if t in (
+        "gcp_workflow",
+        "workflow",
+        "workflow_view",
+        "agent_cost_events",
+        "cost_events",
+        "llm_usage",
+        "agent_usage",
+        "events",
+        "runtime",
+        "runtime_view",
+    ):
+        return "gcp_workflow"
+    return "gcp_billing"
 
 
 ROUTER_SCHEMA: dict[str, Any] = {
@@ -104,6 +148,16 @@ ROUTER_SCHEMA: dict[str, Any] = {
         "clarification_kind": {"type": "string"},
         "missing_slots": {"type": "array", "items": {"type": "string"}},
         "time_scope": {"type": "string"},
+        "bq_target": {
+            "type": "string",
+            "description": (
+                "gcp_billing (invoice/SKUs/INR) or gcp_workflow (runtime view: trace_id, tokens, cost_usd USD). "
+                "Legacy synonym agent_cost_events means gcp_workflow."
+            ),
+        },
+        "bq_target_confidence": {"type": "string"},
+        "usage_correlation_id": {"type": "string"},
+        "needs_data_source_clarification": {"type": "boolean"},
     },
     "required": [
         "rewritten_question",
@@ -136,36 +190,180 @@ def llm_context_router_usable() -> bool:
     return _VERTEX_OK or (_GENAI_OK and bool(_google_ai_key()))
 
 
-def _router_prompt(message: str, today: date) -> str:
+def _deployment_context_for_router() -> str:
+    """Static deployment facts for the router (env-driven, not user-text regex)."""
+    from .workflow_bq_env import workflow_raw_table_name, workflow_table_fqn
+
+    bp = (os.environ.get("BQ_BILLING_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT", "")).strip()
+    ds = os.environ.get("BQ_BILLING_DATASET", "").strip()
+    bt = os.environ.get("BQ_BILLING_TABLE", "").strip()
+    billing_ref = f"{bp}.{ds}.{bt}" if bp and ds and bt else "(billing table not fully configured)"
+    lines = [
+        "Deployment context (authoritative for this runtime):",
+        f"- GCP billing view: `{billing_ref}`",
+        "  Columns: billing_account_id, service_name, sku_description, usage_start_time, usage_end_time, "
+        "invoice_month, project_id, project_name, region, country, cost, cost_at_list, currency, cost_type, "
+        "usage_amount, usage_unit, usage_amount_in_pricing_units, pricing_unit, credits, resource_labels, project_labels.",
+    ]
+    wf_fqn = workflow_table_fqn(billing_project=bp, billing_dataset=ds) if bp and ds else None
+    wf_name = workflow_raw_table_name()
+    if wf_fqn:
+        lines.append(f"- Workflow / runtime view: `{wf_fqn}`")
+        lines.append(
+            "  Columns: timestamp, trace_id, cost_usd, input_tokens, output_tokens — flat view (no jsonPayload)."
+        )
+    elif wf_name:
+        lines.append(f"- Workflow view table name `{wf_name}` is set but project/dataset are incomplete.")
+    else:
+        lines.append("- Workflow / runtime view: not configured (set BQ_WORKFLOW_TABLE or legacy BQ_COST_EVENTS_TABLE).")
+    default_pid = os.environ.get("BILLING_DEFAULT_PROJECT_ID", "").strip()
+    if default_pid:
+        lines.append(
+            f"- Default GCP billing project id for filters: `{default_pid}`. "
+            "When the user says our project / this project / the project (or equivalent) and does not name a different "
+            f"GCP project id, set billing_project_id to `{default_pid}` in resolved_slots and do NOT add "
+            "billing_project_id to required_slots or missing_slots."
+        )
+    else:
+        lines.append(
+            "- No BILLING_DEFAULT_PROJECT_ID is set. Only ask which GCP project id to use if the user explicitly "
+            "scopes to a project you cannot infer from the conversation."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _maybe_apply_default_billing_project(
+    resolved_slots: dict[str, Any],
+    required_slots: list[str],
+    missing_slots: list[str],
+) -> None:
+    """Fill default billing project id when env is set and the model left the slot unresolved."""
+    default_pid = os.environ.get("BILLING_DEFAULT_PROJECT_ID", "").strip()
+    if not default_pid:
+        return
+    cur = str(resolved_slots.get("billing_project_id") or "").strip()
+    if cur:
+        return
+    if "billing_project_id" not in missing_slots and "billing_project_id" not in required_slots:
+        return
+    resolved_slots["billing_project_id"] = default_pid
+    while "billing_project_id" in required_slots:
+        required_slots.remove("billing_project_id")
+    while "billing_project_id" in missing_slots:
+        missing_slots.remove("billing_project_id")
+
+
+def _asks_for_ranked_top_n(text: str) -> bool:
+    tl = " ".join(text.lower().split())
+    return bool(
+        re.search(r"\btop\s+\d+\b", tl)
+        or "most expensive" in tl
+        or "highest cost" in tl
+        or "top spenders" in tl
+    )
+
+
+def _strip_top_n_if_full_service_list(
+    message: str,
+    rewritten: str,
+    required_slots: list[str],
+    missing_slots: list[str],
+) -> None:
+    """Do not require top_n when the user asked for a full per-service breakdown (not a ranked top-N)."""
+    if _asks_for_ranked_top_n(message) or _asks_for_ranked_top_n(rewritten):
+        return
+    blob = f"{message} {rewritten}".lower().replace("-", " ")
+    markers = (
+        "all services",
+        "every service",
+        "each service",
+        "service breakdown",
+        "service wise",
+        "servicewise",
+        "list services",
+        "list all services",
+        "per service",
+        "by service",
+        "service wise cost",
+        "service-wise",
+    )
+    if not any(m in blob for m in markers):
+        return
+    required_slots[:] = [s for s in required_slots if s != "top_n"]
+    missing_slots[:] = [s for s in missing_slots if s != "top_n"]
+
+
+def _router_prompt(message: str, today: date, *, schema_digest: str = "") -> str:
+    digest_block = (
+        f"\nLive BigQuery column digest (authoritative names; truncated):\n{schema_digest}\n"
+        if schema_digest.strip()
+        else ""
+    )
+    deploy = _deployment_context_for_router()
     return (
-        "You are a billing query router. Understand the latest user ask in context and output only JSON.\n"
+        "You are a billing and usage query router. Understand the latest user ask in context and output only JSON.\n"
         "Conversation may include lines prefixed USER:/ASSISTANT:. Use conversation context for follow-ups\n"
         '(e.g. "same as above but for 4 days").\n'
         f"Today is {today.isoformat()}.\n\n"
+        f"{deploy}\n"
+        f"{digest_block}\n"
         "Output fields:\n"
-        "- rewritten_question: standalone query for billing SQL assistant\n"
+        "- rewritten_question: standalone query for the downstream BigQuery SQL assistant\n"
         "- hint: short semicolon-separated summary for UI/source hint\n"
         "- window_start/window_end: YYYY-MM-DD if explicit or inferred safely\n"
         "- time_confident: true if window is confidently inferred from user intent\n"
         "- env: prod/dev/null\n"
         "- service, billing_project_id, billing_region (or null)\n"
-        "- wants_total / wants_top booleans\n\n"
+        "- wants_total / wants_top booleans\n"
+        "- usage_correlation_id: when the user gives a trace / correlation id for the workflow view, set this to that "
+        "exact string (it maps to column trace_id); else null.\n"
+        "- bq_target: gcp_billing | gcp_workflow — choose from user intent and digest above. "
+        "If the model outputs legacy label agent_cost_events, treat it as gcp_workflow.\n"
+        "- bq_target_confidence: high | medium | low — how sure you are.\n"
+        "- needs_data_source_clarification: true if the ask could reasonably be answered from either "
+        "GCP invoice billing (SKUs, INR) OR the workflow/runtime view (tokens, trace_id, cost_usd USD); "
+        "do not guess — ask the user. If confidence is not high, prefer clarification.\n\n"
+        "MANDATORY routing (no exceptions): If the user's wording includes any of: runtime, workflow, trace, "
+        "trace id / trace ID, token usage, input tokens, output tokens — you MUST set bq_target to gcp_workflow, "
+        "set needs_data_source_clarification=false unless the question is genuinely about both invoice line items "
+        "and workflow metrics in the same breath (then clarify). Do NOT send trace or token questions to gcp_billing.\n\n"
+        "Intent types (pick the best fit):\n"
+        "- cost_total: single aggregate or simple sum for a window.\n"
+        "- top_n_ranking: user wants a bounded ranking (e.g. top 5 expensive services) — then require top_n.\n"
+        "- discovery: user wants a full list / breakdown (e.g. all services, every service, service-wise breakdown "
+        "without saying top N) — set wants_top=false, do NOT require top_n; prefer GROUP BY in SQL.\n"
+        "- compare / schema / other as before.\n\n"
         "LLM-first slot contract:\n"
-        "- Set intent_type to one of: cost_total, top_n_ranking, compare, schema, discovery, other.\n"
-        "- Set required_slots to unresolved requirements among: time_window, top_n, compare_scope, compare_entities, column_name.\n"
-        "- Set resolved_slots as an object with any known slot values (example keys: time_window, top_n, compare_scope, service_a, service_b, column_name).\n"
+        "- Set required_slots to unresolved requirements among: time_window, top_n, compare_scope, "
+        "compare_entities, column_name, data_source, billing_project_id (only if you truly cannot infer the GCP project id).\n"
+        "- Set resolved_slots with known values (keys include: time_window, top_n, group_by, compare_scope, "
+        "service_a, service_b, column_name, bq_target, billing_project_id).\n"
         "- Set clarification_priority to exactly one unresolved slot when clarification is needed.\n\n"
         "Clarification rules:\n"
         "- If required slots are missing, set needs_clarification=true.\n"
-        "- Fill clarification_question with one concise question.\n"
+        "- Fill clarification_question with one concise question (never use internal slot names like billing_project_id in the question text).\n"
         "- Fill clarification_options with 2-5 concrete options when useful.\n"
-        "- Fill clarification_kind with one of: time_window, compare_scope, compare_entities, top_n, schema_column, other.\n"
+        "- Fill clarification_kind with one of: time_window, compare_scope, compare_entities, top_n, "
+        "schema_column, data_source, billing_project_id, other.\n"
         "- Fill missing_slots with required unresolved fields.\n"
         "- If question is executable, set needs_clarification=false and leave clarification_* empty.\n\n"
         "Priority rules:\n"
-        "- For ranking asks like 'most expensive services', ask for top_n first if missing.\n"
+        "- For ranking asks ('most expensive', 'top 5 services') ask for top_n first if missing.\n"
+        "- For 'all services' / 'service breakdown' / 'list every service' without a numeric top — use discovery, "
+        "not top_n_ranking; wants_top=false.\n"
         "- For compare asks, ask compare_scope -> compare_entities -> time_window (one at a time).\n"
-        "- For cost_total asks without an explicit time window, ask for time_window instead of guessing.\n\n"
+        "- For cost_total asks without an explicit time window, ask for time_window instead of guessing.\n"
+        "- If needs_data_source_clarification is true, include data_source in missing_slots and set "
+        "clarification_kind=data_source (or set clarification_priority=data_source).\n\n"
+        "Data source semantics:\n"
+        "- gcp_billing: Cloud Billing / invoice export style — services, SKUs, projects, regions, "
+        "usage_start_time, cost in INR (see deployment column list).\n"
+        "- gcp_workflow: Curated workflow/runtime view — timestamp, trace_id, cost_usd (USD), input_tokens, output_tokens. "
+        "Use gcp_workflow for per-trace spend, token counts, agent runtime cost, or any question that names a trace id.\n"
+        "- Use gcp_workflow when the user clearly wants usage-log style answers (tokens, trace, workflow, runtime).\n"
+        "- Use gcp_billing when the user clearly wants GCP invoice / SKU / project / service billing.\n"
+        "- When ambiguous (e.g. 'total cost for X' and X could be a trace id or a project label), set "
+        "needs_data_source_clarification=true and needs_clarification=true.\n\n"
         "Time rules:\n"
         "- For 'this month till now' => first day of this month to today.\n"
         "- For 'March and April combined, until now' (or similar multi-month-to-date phrasing), "
@@ -252,6 +450,11 @@ def _missing_required_slots(
     for slot in required_slots:
         if slot == "time_window":
             if not window_resolved and not str(resolved_slots.get("time_window") or "").strip():
+                missing.append(slot)
+            continue
+        if slot == "data_source":
+            bt = str(resolved_slots.get("bq_target") or "").strip().lower()
+            if bt not in {"gcp_billing", "gcp_workflow"}:
                 missing.append(slot)
             continue
         if slot == "compare_entities":
@@ -375,6 +578,18 @@ def _clarification_for_slot(slot: str) -> tuple[str, list[str], str]:
             [],
             "schema_column",
         )
+    if slot == "data_source":
+        return (
+            "Should I query GCP invoice billing (INR) or the workflow / runtime view (USD, tokens, trace_id)?",
+            ["GCP billing export", "Workflow / runtime view (tokens & traces)"],
+            "data_source",
+        )
+    if slot == "billing_project_id":
+        return (
+            "Which GCP project id should I filter on for billing (for example the value in project.id)?",
+            [],
+            "billing_project_id",
+        )
     return (
         "What time window should I use for this cost query?",
         ["Last 7 days", "This month (month-to-date)", "Full history to date"],
@@ -445,8 +660,14 @@ def _invoke_router(prompt: str) -> BillingRoutePayload:
     raise RuntimeError("No router backend available")
 
 
-def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
-    payload = _invoke_router(_router_prompt(message, today))
+def resolve_cost_context(
+    message: str,
+    *,
+    today: date,
+    schema_digest: str = "",
+    dual_source_available: bool = True,
+) -> ResolvedCostContext:
+    payload = _invoke_router(_router_prompt(message, today, schema_digest=schema_digest))
     scope = (payload.time_scope or "").strip().lower()
     raw_hint = payload.hint.strip() or "no explicit filters"
     text = payload.rewritten_question or message
@@ -464,6 +685,11 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
     intent = _normalized_intent(payload, message)
     required_slots = _slot_list(payload.required_slots)
     resolved_slots = dict(payload.resolved_slots if isinstance(payload.resolved_slots, dict) else {})
+    if "bq_target" in resolved_slots and str(resolved_slots.get("bq_target") or "").strip():
+        resolved_slots["bq_target"] = normalize_bq_target(str(resolved_slots.get("bq_target")))
+    pid_top = _sanitized_str(payload.billing_project_id)
+    if pid_top:
+        resolved_slots.setdefault("billing_project_id", pid_top)
     if not required_slots:
         if intent == "top_n_ranking":
             required_slots = ["top_n", "time_window"]
@@ -471,12 +697,16 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
             required_slots = ["compare_scope", "compare_entities", "time_window"]
         elif intent == "cost_total":
             required_slots = ["time_window"]
+        elif intent == "discovery":
+            required_slots = ["time_window"]
     has_time_scope = scope in {"month_to_date", "mtd", "full_history_to_date"}
     resolved_time_window = str(resolved_slots.get("time_window") or "").strip()
     window_resolved = window_from_payload or has_time_scope or bool(resolved_time_window)
     missing_slots = _slot_list(payload.missing_slots)
     if not missing_slots:
         missing_slots = _missing_required_slots(required_slots, resolved_slots, window_resolved=window_resolved)
+    _maybe_apply_default_billing_project(resolved_slots, required_slots, missing_slots)
+    missing_slots = _missing_required_slots(required_slots, resolved_slots, window_resolved=window_resolved)
     (
         scope,
         window_from_payload,
@@ -500,6 +730,19 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
     resolved_time_window = str(resolved_slots.get("time_window") or "").strip()
     window_resolved = window_from_payload or has_time_scope or bool(resolved_time_window)
     missing_slots = _missing_required_slots(required_slots, resolved_slots, window_resolved=window_resolved)
+    _maybe_apply_default_billing_project(resolved_slots, required_slots, missing_slots)
+    _strip_top_n_if_full_service_list(message, text, required_slots, missing_slots)
+    _maybe_apply_default_billing_project(resolved_slots, required_slots, missing_slots)
+    missing_slots = _missing_required_slots(required_slots, resolved_slots, window_resolved=window_resolved)
+    if dual_source_available and bool(payload.needs_data_source_clarification):
+        if "data_source" not in missing_slots:
+            missing_slots = ["data_source", *missing_slots]
+    elif dual_source_available and normalize_bq_target_confidence(payload.bq_target_confidence) in (
+        "medium",
+        "low",
+    ):
+        if "data_source" not in missing_slots:
+            missing_slots = ["data_source", *missing_slots]
     needs_clarification = bool(missing_slots)
     clarification_priority = (payload.clarification_priority or "").strip().lower() or None
     if clarification_priority in ("null", "none", "undefined", ""):
@@ -540,17 +783,26 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
     env = payload.env.strip().lower() if payload.env else None
     if env not in {"prod", "dev"}:
         env = None
+    bq_t = normalize_bq_target(payload.bq_target)
+    rw = payload.rewritten_question.strip()
+    ucid = _sanitized_str(payload.usage_correlation_id)
+    if ucid and bq_t == "gcp_workflow" and ucid.lower() not in rw.lower():
+        rw = f"{rw}\n(Filter workflow view: trace_id equals the correlation id {ucid!r}.)"
+    merged_bpid = _sanitized_str(str(resolved_slots.get("billing_project_id") or payload.billing_project_id or ""))
+    wants_top_out = (bool(payload.wants_top) or bool(str(resolved_slots.get("top_n") or "").strip())) and (
+        "top_n" in required_slots or "top_n" in missing_slots or bool(str(resolved_slots.get("top_n") or "").strip())
+    )
     return ResolvedCostContext(
-        rewritten_question=payload.rewritten_question.strip(),
+        rewritten_question=rw,
         hint=hint,
         window_start=ws,
         window_end=we,
         env=env,
         service=(payload.service or "").strip().lower() or None,
-        billing_project_id=(payload.billing_project_id or "").strip().lower() or None,
+        billing_project_id=merged_bpid.lower() if merged_bpid else None,
         billing_region=(payload.billing_region or "").strip().lower() or None,
         wants_total=bool(payload.wants_total),
-        wants_top=bool(payload.wants_top) or bool(str(resolved_slots.get("top_n") or "").strip()),
+        wants_top=wants_top_out,
         needs_clarification=needs_clarification,
         clarification_question=clarification_question,
         clarification_options=clarification_options,
@@ -560,4 +812,7 @@ def resolve_cost_context(message: str, *, today: date) -> ResolvedCostContext:
         required_slots=required_slots,
         resolved_slots=resolved_slots,
         clarification_priority=clarification_priority,
+        bq_target=bq_t,
+        bq_target_confidence=normalize_bq_target_confidence(payload.bq_target_confidence),
+        usage_correlation_id=ucid,
     )

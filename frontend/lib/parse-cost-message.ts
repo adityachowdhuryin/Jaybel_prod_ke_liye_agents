@@ -17,6 +17,8 @@ const COLUMN_PRIORITY = [
   "environment",
   "cost_inr",
   "total_inr",
+  "total_usd",
+  "trace_id",
   "currency",
 ];
 
@@ -38,11 +40,24 @@ export type ParsedCostMessage =
     }
   | { kind: "plain"; text: string };
 
-function _formatClarification(question: string, options: string[]): string {
+function _formatClarification(
+  question: string,
+  options: string[],
+  meta?: { clarificationKind?: string; missingSlots?: string[] },
+): string {
   const cleanQuestion = question.trim();
   const cleanOptions = options.map((o) => o.trim()).filter(Boolean);
-  if (!cleanOptions.length) return cleanQuestion;
-  return `${cleanQuestion}\nOptions:\n${cleanOptions.map((o) => `- ${o}`).join("\n")}`;
+  let body =
+    cleanOptions.length > 0
+      ? `${cleanQuestion}\nOptions:\n${cleanOptions.map((o) => `- ${o}`).join("\n")}`
+      : cleanQuestion;
+  const kind = meta?.clarificationKind?.trim();
+  const missing = (meta?.missingSlots ?? []).map((s) => String(s).trim()).filter(Boolean);
+  const extras: string[] = [];
+  if (kind) extras.push(`Type: ${kind.replace(/_/g, " ")}`);
+  if (missing.length) extras.push(`Still need: ${missing.join(", ").replace(/_/g, " ")}`);
+  if (extras.length) body += `\n\n${extras.join(" · ")}`;
+  return body;
 }
 
 function parseStructuredCostPayload(raw: string): ParsedCostMessage | null {
@@ -61,7 +76,18 @@ function parseStructuredCostPayload(raw: string): ParsedCostMessage | null {
     const options = Array.isArray(optionsRaw)
       ? optionsRaw.map((x) => String(x))
       : [];
-    return { kind: "plain", text: _formatClarification(question, options) };
+    const clarificationKind = String(payload.clarification_kind ?? "").trim();
+    const missingRaw = payload.missing_slots;
+    const missingSlots = Array.isArray(missingRaw)
+      ? missingRaw.map((x) => String(x))
+      : [];
+    return {
+      kind: "plain",
+      text: _formatClarification(question, options, {
+        clarificationKind: clarificationKind || undefined,
+        missingSlots: missingSlots.length ? missingSlots : undefined,
+      }),
+    };
   }
   if (responseType === "error") {
     const detail = String(payload.detail ?? "I cannot verify this from current data.");
@@ -287,8 +313,31 @@ function extractFirstJson(s: string): {
   return null;
 }
 
+/** Normalize agent/orchestrator variants so COST_PAYLOAD_JSON parses reliably. */
+function normalizeCostPayload(raw: string): string {
+  const trimmed = raw.trimStart();
+  const loose = /^COST_PAYLOAD_JSON:\s*/i.exec(trimmed);
+  if (loose && loose.index === 0) {
+    const rest = trimmed.slice(loose[0].length).trimStart();
+    return `${COST_PAYLOAD_MARKER}${rest}`;
+  }
+  if (/^\{[\s\S]*"response_type"[\s\S]*\}/.test(trimmed)) {
+    try {
+      const j = JSON.parse(trimmed) as Record<string, unknown>;
+      const rt = String(j.response_type ?? "").toLowerCase();
+      if (rt === "clarification" || rt === "error" || rt === "result") {
+        return `${COST_PAYLOAD_MARKER}${trimmed}`;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return raw;
+}
+
 export function parseCostAssistantMessage(raw: string): ParsedCostMessage {
-  const structured = parseStructuredCostPayload(raw);
+  const normalized = normalizeCostPayload(raw);
+  const structured = parseStructuredCostPayload(normalized);
   if (structured) return structured;
 
   if (raw.includes("CLARIFICATION_REQUIRED:") || raw.includes("\nOptions:\n- ")) {

@@ -4,6 +4,26 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
 
+function Import-GcpEnvFile {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    Write-Host ">>> Loaded $Path"
+    Get-Content -LiteralPath $Path | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith('#')) { return }
+        if ($line.StartsWith('export ')) { $line = $line.Substring(7).Trim() }
+        $eq = $line.IndexOf('=')
+        if ($eq -lt 1) { return }
+        $k = $line.Substring(0, $eq).Trim()
+        $v = $line.Substring($eq + 1).Trim().TrimEnd("`r")
+        if (($v.StartsWith('"') -and $v.EndsWith('"')) -or ($v.StartsWith("'") -and $v.EndsWith("'"))) {
+            $v = $v.Substring(1, $v.Length - 2)
+        }
+        if ($k) { Set-Item -Path "Env:$k" -Value $v }
+    }
+}
+Import-GcpEnvFile (Join-Path $RepoRoot "config\gcp.env")
+
 New-Item -ItemType Directory -Force -Path (Join-Path $RepoRoot "logs") | Out-Null
 
 Write-Host ">>> Starting postgres (docker compose)..."
@@ -28,11 +48,15 @@ $feDir = Join-Path $RepoRoot "frontend"
 
 $env:DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5435/postgres"
 
-# BigQuery billing export defaults (override via config\gcp.env)
+# BigQuery defaults (config\gcp.env loaded above when present)
 if (-not $env:GOOGLE_CLOUD_PROJECT) { $env:GOOGLE_CLOUD_PROJECT = "gls-training-486405" }
 if (-not $env:BQ_BILLING_PROJECT) { $env:BQ_BILLING_PROJECT = $env:GOOGLE_CLOUD_PROJECT }
 if (-not $env:BQ_BILLING_DATASET) { $env:BQ_BILLING_DATASET = "gcp_billing_data" }
-if (-not $env:BQ_BILLING_TABLE) { $env:BQ_BILLING_TABLE = "clean_billing_view" }
+if (-not $env:BQ_BILLING_TABLE) { $env:BQ_BILLING_TABLE = "jaybel_prod_billing_view" }
+if (-not $env:BQ_WORKFLOW_PROJECT) { $env:BQ_WORKFLOW_PROJECT = $env:BQ_BILLING_PROJECT }
+if (-not $env:BQ_WORKFLOW_DATASET) { $env:BQ_WORKFLOW_DATASET = $env:BQ_BILLING_DATASET }
+if (-not $env:BQ_WORKFLOW_TABLE) { $env:BQ_WORKFLOW_TABLE = "jaybel_prod_workflow_view" }
+if (-not $env:ORCHESTRATOR_AUTH_DISABLED) { $env:ORCHESTRATOR_AUTH_DISABLED = "1" }
 $saKey = Join-Path $RepoRoot "frontend\.secrets\speech-sa.json"
 if (-not $env:GOOGLE_APPLICATION_CREDENTIALS -and (Test-Path $saKey)) {
     $env:GOOGLE_APPLICATION_CREDENTIALS = $saKey

@@ -80,7 +80,12 @@ export ORCHESTRATOR_AUTH_DISABLED="${ORCHESTRATOR_AUTH_DISABLED:-1}"
 # BigQuery Cloud Billing export (cost agent). Override in config/gcp.env.
 export BQ_BILLING_PROJECT="${BQ_BILLING_PROJECT:-${GOOGLE_CLOUD_PROJECT:-}}"
 export BQ_BILLING_DATASET="${BQ_BILLING_DATASET:-gcp_billing_data}"
-export BQ_BILLING_TABLE="${BQ_BILLING_TABLE:-clean_billing_view}"
+export BQ_BILLING_TABLE="${BQ_BILLING_TABLE:-jaybel_prod_billing_view}"
+# Workflow / runtime view (same project+dataset as billing unless overridden in config/gcp.env).
+export BQ_WORKFLOW_PROJECT="${BQ_WORKFLOW_PROJECT:-${BQ_BILLING_PROJECT:-}}"
+export BQ_WORKFLOW_DATASET="${BQ_WORKFLOW_DATASET:-${BQ_BILLING_DATASET:-}}"
+export BQ_WORKFLOW_TABLE="${BQ_WORKFLOW_TABLE:-jaybel_prod_workflow_view}"
+# Legacy BQ_COST_EVENTS_* (optional in config/gcp.env) is still honored as a table-name fallback when BQ_WORKFLOW_TABLE is unset.
 
 echo ">>> Starting orchestrator :8000..."
 (cd "$ROOT/agents/orchestrator" && nohup "$PYTHON_BIN" -m uvicorn main:app --host 127.0.0.1 --port 8000 \

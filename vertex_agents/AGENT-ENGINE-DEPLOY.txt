@@ -11,7 +11,14 @@ Folders (pass these paths to adk deploy agent_engine):
 
 Deploy order (fresh engines)
 ----------------------------
-1) Deploy cost_metrics_agent first (BigQuery + clean_billing_view mode).
+1) Deploy cost_metrics_agent first (BigQuery + jaybel_prod_billing_view mode).
+   Default deploy writes BQ_WORKFLOW_* for jaybel_prod_workflow_view (override with
+   --workflow-table). Legacy --cost-events-table still maps to BQ_COST_EVENTS_* if needed.
+   With both billing and workflow views set, routing is LLM-first (structured router);
+   legacy regex overrides and deterministic trace SQL are opt-in via
+   BILLING_LEGACY_REGEX_ROUTING / BILLING_DETERMINISTIC_TRACE_TOTAL.
+   Optional: --billing-default-project-id jaybel-prod sets BILLING_DEFAULT_PROJECT_ID on the
+   cost engine (stops unnecessary "which project?" clarifications for "our project" asks).
 2) Copy the new cost engine ID/resource from deploy output or console.
 3) Deploy pa_orchestrator_agent with COST_AGENT_QUERY_ENDPOINT pointing to the
    new cost engine.
@@ -36,10 +43,26 @@ macOS/Linux (from repo root)
   ./scripts/deploy-agent-engine.sh cost --force-new-engine
   ./scripts/deploy-agent-engine.sh orchestrator --force-new-engine --cost-agent-engine-id <NEW_COST_ENGINE_ID>
 
-Local stack check
------------------
-After running .\scripts\start-all.ps1:
-  .\scripts\check-local-stack.ps1
+Local UI preflight (http://127.0.0.1:3000 via scripts/start-all.*)
+--------------------------------------------------------------------
+- source config/gcp.env (or set by hand): GOOGLE_CLOUD_PROJECT, ADC
+  (`gcloud auth application-default login`), ORCHESTRATOR_AGENT_ENGINE_RESOURCE,
+  and optional ORCHESTRATOR_AGENT_ENGINE_QUERY_URL.
+- Redeploy cost_metrics_agent after this change so the engine has BQ_WORKFLOW_*
+  (deploy script defaults to jaybel_prod_workflow_view) or set BQ_WORKFLOW_TABLE
+  in the engine .env in console.
+- start-all sets BQ_WORKFLOW_* defaults for host tools; Agent Engine still uses
+  the .env baked in at deploy time.
+- After `.\scripts\start-all.ps1` (Windows) or `./scripts/start-all.sh` (macOS/Linux):
+  run `.\scripts\check-local-stack.ps1` when present.
+
+Cost UX smoke (optional; needs orchestrator :8000 + Agent Engine env)
+-----------------------------------------------------------------------
+  source .venv/bin/activate
+  source config/gcp.env   # or set ORCHESTRATOR_* by hand
+  export ORCHESTRATOR_AUTH_DISABLED=1
+  python scripts/smoke-orchestrator-cost-questions.py
+  # If engine not reachable yet: SMOKE_SKIP_IF_UNAVAILABLE=1 python scripts/smoke-orchestrator-cost-questions.py
 
 Next.js UI -> Vertex Agent Engine (every chat invokes the engine)
 ------------------------------------------------------------------
